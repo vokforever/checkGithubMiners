@@ -32,7 +32,7 @@ REPOS = [
 
 STATE_FILE = "last_releases.json"
 FILTERS_FILE = "user_filters.json"
-HISTORY_FILE = "releases_history.json"  # Новый файл для истории релизов
+HISTORY_FILE = "releases_history.json"
 
 # --- ЛОГИРОВАНИЕ ---
 logging.basicConfig(
@@ -374,8 +374,12 @@ async def check_updates(bot: Bot):
                 # Если нет фильтров у пользователей, отправляем в основной канал
                 if not notified_users and CHANNEL_ID:
                     message = format_release_message(repo_name, release)
-                    await bot.send_message(CHANNEL_ID, message, parse_mode="Markdown")
-                    logger.info(f"Уведомление отправлено в канал для {repo_name} {current_tag}")
+                    try:
+                        await bot.send_message(CHANNEL_ID, message, parse_mode="Markdown")
+                        logger.info(f"Уведомление отправлено в канал для {repo_name} {current_tag}")
+                    except Exception as e:
+                        logger.error(f"Ошибка отправки сообщения в канал: {e}")
+                        # Продолжаем работу даже если не удалось отправить в канал
 
                 state[repo_name] = current_tag
 
@@ -429,13 +433,31 @@ async def today_command(message: Message):
 # --- КОМАНДА /filter ---
 async def filter_command(message: Message):
     print(f"Пользователь {message.from_user.id} хочет установить фильтры")
+
+    # Создаем клавиатуру с кнопкой "Отмена"
+    keyboard = InlineKeyboardBuilder()
+    keyboard.button(text="❌ Отмена", callback_data="cancel_filter")
+
     await message.answer(
         "🔍 *Настройка фильтров*\n\n"
         "Введите ключевые слова через пробел, по которым будет производиться фильтрация релизов.\n"
         "Например: `qubitcoin qtc`\n\n"
-        "Бот будет искать совпадения в названиях релизов и описаниях."
+        "Бот будет искать совпадения в названиях релизов и описаниях.",
+        reply_markup=keyboard.as_markup()
     )
     await message.answer("⏳ Ожидаю ввод ключевых слов...")
+
+
+# --- ОБРАБОТКА КНОПКИ ОТМЕНЫ ---
+async def cancel_filter_callback(callback: CallbackQuery):
+    user_id = str(callback.from_user.id)
+    print(f"Пользователь {user_id} отменил установку фильтров")
+
+    await callback.message.edit_text(
+        "❌ *Настройка фильтров отменена*",
+        reply_markup=None
+    )
+    await callback.answer()
 
 
 # --- ОБРАБОТКА ТЕКСТА ПОСЛЕ /filter ---
@@ -528,6 +550,10 @@ def register_handlers(dp: Dispatcher):
 
     # Обработка текста после команды /filter
     dp.message.register(process_filter_text, F.text & ~F.command)
+
+    # Обработка кнопки "Отмена"
+    dp.callback_query.register(cancel_filter_callback, F.data == "cancel_filter")
+
     print("Обработчики зарегистрированы")
 
 
