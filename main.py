@@ -27,7 +27,16 @@ CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "10"))
 
 REPOS = [
     "https://github.com/andru-kun/wildrig-multi/releases",
-    "https://github.com/OneZeroMiner/onezerominer/releases"
+    "https://github.com/OneZeroMiner/onezerominer/releases",
+    "https://github.com/trexminer/T-Rex/releases",
+    "https://github.com/xmrig/xmrig/releases",
+    "https://github.com/Lolliedieb/lolMiner-releases/releases",
+    "https://github.com/doktor83/SRBMiner-Multi/releases",
+    "https://github.com/nicehash/nicehashminer/releases",
+    "https://github.com/pooler/cpuminer/releases",
+    "https://github.com/rplant8/cpuminer-opt-rplant/releases",
+    "https://github.com/JayDDee/cpuminer-opt/releases",
+    "https://github.com/alephium/cpu-miner/releases"
 ]
 
 STATE_FILE = "last_releases.json"
