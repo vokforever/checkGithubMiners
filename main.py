@@ -25,6 +25,7 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # ID администратора
 CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "10"))
+DONATE_URL = "https://boosty.to/vokforever/donate"  # Ссылка для доната
 REPOS = [
     "https://github.com/andru-kun/wildrig-multi/releases",
     "https://github.com/OneZeroMiner/onezerominer/releases",
@@ -418,6 +419,7 @@ async def start_command(message: Message):
         "/myfilters - посмотреть текущие фильтры\n"
         "/clearfilters - очистить все фильтры\n"
         "/today - релизы за сегодня\n"
+        "/donate - поддержать разработчика\n"
         "/help - справка по использованию"
     )
     # Отправляем последние релизы за 3 дня
@@ -543,6 +545,29 @@ async def stats_command(message: Message):
     await message.answer(stats_message, parse_mode="Markdown")
 
 
+# --- КОМАНДА /donate ---
+async def donate_command(message: Message):
+    add_user(message.from_user.id)
+    print(f"Пользователь {message.from_user.id} запросил информацию о донате")
+
+    # Создаем клавиатуру с кнопкой для перехода на Boosty
+    keyboard = InlineKeyboardBuilder()
+    keyboard.button(text="💝 Поддержать разработчика", url=DONATE_URL)
+
+    await message.answer(
+        "💖 *Спасибо за интерес к поддержке моего проекта!*\n\n"
+        "Если вам нравится мой бот и вы хотите помочь в его развитии, "
+        "вы можете поддержать меня финансово. Любая сумма будет принята с благодарностью! 🙏\n\n"
+        "Ваши пожертвования помогут:\n"
+        "• Оплачивать сервер для работы бота 24/7\n"
+        "• Разрабатывать новые функции\n"
+        "• Улучшать существующий функционал\n\n"
+        "Нажмите на кнопку ниже, чтобы перейти на страницу доната:",
+        reply_markup=keyboard.as_markup(),
+        parse_mode="Markdown"
+    )
+
+
 # --- КОМАНДА /help ---
 async def help_command(message: Message):
     add_user(message.from_user.id)
@@ -560,6 +585,8 @@ async def help_command(message: Message):
         "📅 *Просмотр релизов:*\n"
         "/today - показать релизы за сегодня\n"
         "/start - показать последние релизы за 3 дня\n\n"
+        "💝 *Поддержка проекта:*\n"
+        "/donate - поддержать разработчика\n\n"
         "📌 *Как работает фильтрация:*\n"
         "Бот ищет ключевые слова в:\n"
         "• Названии релиза\n"
@@ -580,6 +607,7 @@ def register_handlers(dp: Dispatcher):
     dp.message.register(today_command, Command("today"))
     dp.message.register(help_command, Command("help"))
     dp.message.register(stats_command, Command("stats"))
+    dp.message.register(donate_command, Command("donate"))
     # Обработка текста после команды /filter
     dp.message.register(process_filter_text, F.text & ~F.command)
     # Обработка кнопки "Отмена"
