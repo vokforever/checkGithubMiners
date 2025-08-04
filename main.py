@@ -4,7 +4,7 @@ import os
 import logging
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Optional, List, Set
 
 from aiohttp import ClientSession, ClientError
@@ -32,6 +32,7 @@ REPOS = [
 
 STATE_FILE = "last_releases.json"
 FILTERS_FILE = "user_filters.json"
+HISTORY_FILE = "releases_history.json"  # Новый файл для истории релизов
 
 # --- ЛОГИРОВАНИЕ ---
 logging.basicConfig(
@@ -80,9 +81,37 @@ def save_filters(filters):
         json.dump(filters, f)
 
 
-# Глобальное хранилище фильтров
+# --- ХРАНЕНИЕ ИСТОРИИ РЕЛИЗОВ ---
+def load_history():
+    if os.path.exists(HISTORY_FILE):
+        with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return []
+
+
+def save_history(history):
+    # Очищаем старые записи (старше 30 дней)
+    if history:
+        thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
+        filtered_history = []
+        for rel in history:
+            try:
+                pub_date = datetime.fromisoformat(rel['published_at'].replace('Z', '+00:00'))
+                if pub_date >= thirty_days_ago:
+                    filtered_history.append(rel)
+            except:
+                continue
+        history = filtered_history
+
+    with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
+
+
+# Глобальное хранилище фильтров и истории
 user_filters = load_filters()
+releases_history = load_history()
 print(f"Загружено фильтров для {len(user_filters)} пользователей")
+print(f"Загружено записей в истории релизов: {len(releases_history)}")
 
 
 # --- ПАРСИНЧИК HTML СТРАНИЦЫ РЕЛИЗОВ ---
@@ -243,6 +272,63 @@ def format_release_message(repo_name, release):
     return message
 
 
+# --- ДОБАВЛЕНИЕ РЕЛИЗА В ИСТОРИЮ ---
+def add_to_history(repo_name, release):
+    global releases_history
+
+    # Проверяем, нет ли уже такого релиза в истории
+    exists = any(
+        rel['repo_name'] == repo_name and rel['tag_name'] == release.get('tag_name')
+        for rel in releases_history
+    )
+
+    if not exists:
+        history_entry = {
+            'repo_name': repo_name,
+            'tag_name': release.get('tag_name'),
+            'name': release.get('name'),
+            'published_at': release.get('published_at'),
+            'body': release.get('body'),
+            'assets': release.get('assets', [])
+        }
+        releases_history.append(history_entry)
+        save_history(releases_history)
+        print(f"Добавлен релиз в историю: {repo_name} {release.get('tag_name')}")
+
+
+# --- ПОЛУЧЕНИЕ РЕЛИЗОВ ЗА ДАТУ ---
+def get_releases_by_date(target_date):
+    """Возвращает релизы за указанную дату"""
+    releases = []
+    for rel in releases_history:
+        try:
+            pub_date = datetime.fromisoformat(rel['published_at'].replace('Z', '+00:00')).date()
+            if pub_date == target_date:
+                releases.append(rel)
+        except:
+            continue
+    return releases
+
+
+# --- ПОЛУЧЕНИЕ РЕЛИЗОВ ЗА ПОСЛЕДНИЕ ДНИ ---
+def get_recent_releases(days=3):
+    """Возвращает релизы за последние N дней"""
+    releases = []
+    cutoff_date = datetime.now(timezone.utc).date() - timedelta(days=days)
+
+    for rel in releases_history:
+        try:
+            pub_date = datetime.fromisoformat(rel['published_at'].replace('Z', '+00:00')).date()
+            if pub_date >= cutoff_date:
+                releases.append(rel)
+        except:
+            continue
+
+    # Сортируем по дате (новые сначала)
+    releases.sort(key=lambda x: x['published_at'], reverse=True)
+    return releases
+
+
 # --- ПРОВЕРКА ОБНОВЛЕНИЙ С ФИЛЬТРАЦИЕЙ ---
 async def check_updates(bot: Bot):
     logger.info("Проверка обновлений...")
@@ -268,6 +354,9 @@ async def check_updates(bot: Bot):
 
             if last_tag != current_tag:
                 print(f"Найден новый релиз: {current_tag}")
+                # Добавляем в историю
+                add_to_history(repo_name, release)
+
                 # Проверяем для каждого пользователя с его фильтрами
                 notified_users = set()
                 for user_id, filters in user_filters.items():
@@ -298,14 +387,43 @@ async def check_updates(bot: Bot):
 # --- КОМАНДА /start ---
 async def start_command(message: Message):
     print(f"Получена команда /start от пользователя {message.from_user.id}")
+
+    # Отправляем приветственное сообщение
     await message.answer(
         "👋 Привет! Я бот для отслеживания релизов на GitHub.\n\n"
         "📌 *Основные команды:*\n"
         "/filter - установить фильтры для уведомлений\n"
         "/myfilters - посмотреть текущие фильтры\n"
         "/clearfilters - очистить все фильтры\n"
+        "/today - релизы за сегодня\n"
         "/help - справка по использованию"
     )
+
+    # Отправляем последние релизы за 3 дня
+    recent_releases = get_recent_releases(3)
+    if recent_releases:
+        await message.answer("📅 *Последние релизы за 3 дня:*\n")
+        for rel in recent_releases:
+            msg = format_release_message(rel['repo_name'], rel)
+            await message.answer(msg, parse_mode="Markdown")
+    else:
+        await message.answer("📭 За последние 3 дня релизов не было.")
+
+
+# --- КОМАНДА /today ---
+async def today_command(message: Message):
+    print(f"Пользователь {message.from_user.id} запрашивает релизы за сегодня")
+
+    today = datetime.now(timezone.utc).date()
+    today_releases = get_releases_by_date(today)
+
+    if not today_releases:
+        await message.answer("📭 Сегодня релизов не было.")
+    else:
+        await message.answer("📅 *Релизы за сегодня:*\n")
+        for rel in today_releases:
+            msg = format_release_message(rel['repo_name'], rel)
+            await message.answer(msg, parse_mode="Markdown")
 
 
 # --- КОМАНДА /filter ---
@@ -385,6 +503,9 @@ async def help_command(message: Message):
         "/filter - установить фильтры\n"
         "/myfilters - показать текущие фильтры\n"
         "/clearfilters - удалить все фильтры\n\n"
+        "📅 *Просмотр релизов:*\n"
+        "/today - показать релизы за сегодня\n"
+        "/start - показать последние релизы за 3 дня\n\n"
         "📌 *Как работает фильтрация:*\n"
         "Бот ищет ключевые слова в:\n"
         "• Названии релиза\n"
@@ -402,6 +523,7 @@ def register_handlers(dp: Dispatcher):
     dp.message.register(filter_command, Command("filter"))
     dp.message.register(myfilters_command, Command("myfilters"))
     dp.message.register(clearfilters_command, Command("clearfilters"))
+    dp.message.register(today_command, Command("today"))
     dp.message.register(help_command, Command("help"))
 
     # Обработка текста после команды /filter
@@ -442,6 +564,15 @@ async def main():
 
     logger.info("Бот успешно запущен")
     print("=== Бот запущен и готов к работе ===")
+
+    # Запускаем первоначальную проверку релизов
+    print("Запускаю первоначальную проверку релизов...")
+    try:
+        await check_updates(bot)
+        print("Первоначальная проверка релизов завершена")
+    except Exception as e:
+        logger.error(f"Ошибка при первоначальной проверке релизов: {e}")
+        print(f"ОШИБКА при первоначальной проверке: {e}")
 
     # Запуск поллинга
     try:
