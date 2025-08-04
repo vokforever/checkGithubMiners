@@ -4,9 +4,9 @@ import os
 import logging
 import re
 import sys
+import warnings
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Optional, List, Set
-
 from aiohttp import ClientSession, ClientError
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
@@ -23,8 +23,8 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # ID администратора
 CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "10"))
-
 REPOS = [
     "https://github.com/andru-kun/wildrig-multi/releases",
     "https://github.com/OneZeroMiner/onezerominer/releases",
@@ -38,10 +38,10 @@ REPOS = [
     "https://github.com/JayDDee/cpuminer-opt/releases",
     "https://github.com/alephium/cpu-miner/releases"
 ]
-
 STATE_FILE = "last_releases.json"
 FILTERS_FILE = "user_filters.json"
 HISTORY_FILE = "releases_history.json"
+USERS_FILE = "users.json"  # Файл для хранения пользователей
 
 # --- ЛОГИРОВАНИЕ ---
 logging.basicConfig(
@@ -58,10 +58,35 @@ logger = logging.getLogger(__name__)
 print("=== Проверка конфигурации ===")
 print(f"BOT_TOKEN: {'Установлен' if BOT_TOKEN else 'ОТСУТСТВУЕТ'}")
 print(f"CHANNEL_ID: {CHANNEL_ID if CHANNEL_ID else 'ОТСУТСТВУЕТ'}")
+print(f"ADMIN_ID: {ADMIN_ID if ADMIN_ID else 'ОТСУТСТВУЕТ'}")
 print(f"CHECK_INTERVAL_MINUTES: {CHECK_INTERVAL_MINUTES}")
 print(f"Репозитории для отслеживания: {len(REPOS)}")
 for i, repo in enumerate(REPOS, 1):
     print(f"  {i}. {repo}")
+
+
+# --- ХРАНЕНИЕ ПОЛЬЗОВАТЕЛЕЙ ---
+def load_users():
+    if os.path.exists(USERS_FILE):
+        with open(USERS_FILE, 'r') as f:
+            return set(json.load(f))
+    return set()
+
+
+def save_users(users):
+    with open(USERS_FILE, 'w') as f:
+        json.dump(list(users), f)
+
+
+# Глобальное множество пользователей
+all_users = load_users()
+
+
+def add_user(user_id):
+    if user_id not in all_users:
+        all_users.add(user_id)
+        save_users(all_users)
+        print(f"Новый пользователь: {user_id}")
 
 
 # --- ХРАНЕНИЕ СОСТОЯНИЯ ---
@@ -111,7 +136,6 @@ def save_history(history):
             except:
                 continue
         history = filtered_history
-
     with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
         json.dump(history, f, ensure_ascii=False, indent=2)
 
@@ -121,6 +145,7 @@ user_filters = load_filters()
 releases_history = load_history()
 print(f"Загружено фильтров для {len(user_filters)} пользователей")
 print(f"Загружено записей в истории релизов: {len(releases_history)}")
+print(f"Всего пользователей: {len(all_users)}")
 
 
 # --- ПАРСИНЧИК HTML СТРАНИЦЫ РЕЛИЗОВ ---
@@ -129,34 +154,26 @@ async def parse_html_releases(session, repo_url):
         async with session.get(repo_url) as response:
             if response.status != 200:
                 return None
-
             html = await response.text()
             soup = BeautifulSoup(html, 'html.parser')
-
             release_section = soup.find('section', {'class': 'release-entry'})
             if not release_section:
                 return None
-
             release_data = {}
-
             tag_element = release_section.find('a', {'class': 'Link--primary'})
             if tag_element:
                 release_data['tag_name'] = tag_element.get_text(strip=True)
-
             name_element = release_section.find('div', {'class': 'release-main-section'})
             if name_element:
                 h1 = name_element.find('h1')
                 if h1:
                     release_data['name'] = h1.get_text(strip=True)
-
             date_element = release_section.find('relative-time')
             if date_element:
                 release_data['published_at'] = date_element.get('datetime')
-
             desc_element = release_section.find('div', {'class': 'markdown-body'})
             if desc_element:
                 release_data['body'] = desc_element.get_text(strip=True)
-
             assets = []
             asset_links = release_section.find_all('a', {'href': re.compile(r'/releases/download/')})
             for link in asset_links:
@@ -167,10 +184,8 @@ async def parse_html_releases(session, repo_url):
                         'name': asset_name,
                         'browser_download_url': asset_url
                     })
-
             release_data['assets'] = assets
             return release_data
-
     except Exception as e:
         logger.error(f"HTML parsing failed for {repo_url}: {e}")
         return None
@@ -182,7 +197,6 @@ async def fetch_release(session, repo_url, max_retries=3):
     headers = {}
     if GITHUB_TOKEN:
         headers['Authorization'] = f'token {GITHUB_TOKEN}'
-
     for attempt in range(max_retries):
         try:
             async with session.get(api_url, headers=headers) as response:
@@ -198,18 +212,15 @@ async def fetch_release(session, repo_url, max_retries=3):
                 elif response.status == 404:
                     logger.error(f"Repository not found via API: {repo_url}")
                     break
-
             logger.info(f"Falling back to HTML parsing for {repo_url}")
             html_data = await parse_html_releases(session, repo_url)
             if html_data:
                 return html_data
-
         except ClientError as e:
             logger.error(f"Request failed: {e}")
             if attempt == max_retries - 1:
                 return await parse_html_releases(session, repo_url)
             await asyncio.sleep(2 ** attempt)
-
     return None
 
 
@@ -217,27 +228,28 @@ async def fetch_release(session, repo_url, max_retries=3):
 def matches_filters(release_data: dict, keywords: List[str]) -> bool:
     if not keywords:
         return True
-
     search_text = ""
-
     # Добавляем название релиза
     if release_data.get('name'):
         search_text += release_data['name'].lower() + " "
-
     # Добавляем тег
     if release_data.get('tag_name'):
         search_text += release_data['tag_name'].lower() + " "
-
     # Добавляем описание
     if release_data.get('body'):
         search_text += release_data['body'].lower() + " "
-
     # Проверяем каждое ключевое слово
     for keyword in keywords:
         if keyword.lower() not in search_text:
             return False
-
     return True
+
+
+# --- ЭКРАНИРОВАНИЕ СИМВОЛОВ MARKDOWN ---
+def escape_markdown(text: str) -> str:
+    """Экранирует специальные символы Markdown для Telegram"""
+    escape_chars = '_*`[]()'
+    return ''.join(f'\\{char}' if char in escape_chars else char for char in text)
 
 
 # --- ФОРМАТИРОВАНИЕ СООБЩЕНИЯ ---
@@ -248,17 +260,15 @@ def format_release_message(repo_name, release):
     published_at = release.get('published_at', '')
     assets = release.get('assets', [])
 
-    links = []
-    for asset in assets:
-        asset_name = asset.get('name', '')
-        download_url = asset.get('browser_download_url', '')
-        if asset_name and download_url and not asset_name.startswith("Source code"):
-            links.append(f"[{asset_name}]({download_url})")
+    # Экранируем символы Markdown в тексте
+    repo_name_escaped = escape_markdown(repo_name)
+    name_escaped = escape_markdown(name)
+    tag_escaped = escape_markdown(tag)
 
     message = (
-        f"🚀 *Новый релиз в репозитории {repo_name}*\n\n"
-        f"*{name}*\n"
-        f"`{tag}`\n"
+        f"🚀 *Новый релиз в репозитории {repo_name_escaped}*\n\n"
+        f"*{name_escaped}*\n"
+        f"`{tag_escaped}`\n"
     )
 
     if published_at:
@@ -271,7 +281,18 @@ def format_release_message(repo_name, release):
         message += "\n"
 
     if body:
-        message += f"{body}\n\n"
+        # Экранируем символы Markdown в теле сообщения
+        body_escaped = escape_markdown(body)
+        message += f"{body_escaped}\n\n"
+
+    links = []
+    for asset in assets:
+        asset_name = asset.get('name', '')
+        download_url = asset.get('browser_download_url', '')
+        if asset_name and download_url and not asset_name.startswith("Source code"):
+            # Экранируем имя файла
+            asset_name_escaped = escape_markdown(asset_name)
+            links.append(f"[{asset_name_escaped}]({download_url})")
 
     if links:
         message += "📥 *Ссылки для скачивания:*\n" + "\n".join(links)
@@ -284,13 +305,11 @@ def format_release_message(repo_name, release):
 # --- ДОБАВЛЕНИЕ РЕЛИЗА В ИСТОРИЮ ---
 def add_to_history(repo_name, release):
     global releases_history
-
     # Проверяем, нет ли уже такого релиза в истории
     exists = any(
         rel['repo_name'] == repo_name and rel['tag_name'] == release.get('tag_name')
         for rel in releases_history
     )
-
     if not exists:
         history_entry = {
             'repo_name': repo_name,
@@ -324,7 +343,6 @@ def get_recent_releases(days=3):
     """Возвращает релизы за последние N дней"""
     releases = []
     cutoff_date = datetime.now(timezone.utc).date() - timedelta(days=days)
-
     for rel in releases_history:
         try:
             pub_date = datetime.fromisoformat(rel['published_at'].replace('Z', '+00:00')).date()
@@ -332,7 +350,6 @@ def get_recent_releases(days=3):
                 releases.append(rel)
         except:
             continue
-
     # Сортируем по дате (новые сначала)
     releases.sort(key=lambda x: x['published_at'], reverse=True)
     return releases
@@ -348,24 +365,19 @@ async def check_updates(bot: Bot):
             print(f"Проверяю репозиторий: {repo_url}")
             repo_name = repo_url.split("/")[-2] + "/" + repo_url.split("/")[-1]
             release = await fetch_release(session, repo_url)
-
             if not release:
                 logger.warning(f"Не получены данные о релизах для {repo_name}")
                 continue
-
             current_tag = release.get('tag_name')
             if not current_tag:
                 logger.warning(f"Не найден тег в данных релиза для {repo_name}")
                 continue
-
             last_tag = state.get(repo_name)
             print(f"Текущий тег: {current_tag}, предыдущий: {last_tag}")
-
             if last_tag != current_tag:
                 print(f"Найден новый релиз: {current_tag}")
                 # Добавляем в историю
                 add_to_history(repo_name, release)
-
                 # Проверяем для каждого пользователя с его фильтрами
                 notified_users = set()
                 for user_id, filters in user_filters.items():
@@ -379,7 +391,6 @@ async def check_updates(bot: Bot):
                                     f"Уведомление отправлено пользователю {user_id} для {repo_name} {current_tag}")
                             except Exception as e:
                                 logger.error(f"Ошибка отправки сообщения пользователю {user_id}: {e}")
-
                 # Если нет фильтров у пользователей, отправляем в основной канал
                 if not notified_users and CHANNEL_ID:
                     message = format_release_message(repo_name, release)
@@ -389,9 +400,7 @@ async def check_updates(bot: Bot):
                     except Exception as e:
                         logger.error(f"Ошибка отправки сообщения в канал: {e}")
                         # Продолжаем работу даже если не удалось отправить в канал
-
                 state[repo_name] = current_tag
-
     save_state(state)
     print("=== Проверка обновлений завершена ===")
     logger.info("Проверка обновлений завершена")
@@ -399,8 +408,8 @@ async def check_updates(bot: Bot):
 
 # --- КОМАНДА /start ---
 async def start_command(message: Message):
+    add_user(message.from_user.id)
     print(f"Получена команда /start от пользователя {message.from_user.id}")
-
     # Отправляем приветственное сообщение
     await message.answer(
         "👋 Привет! Я бот для отслеживания релизов на GitHub.\n\n"
@@ -411,7 +420,6 @@ async def start_command(message: Message):
         "/today - релизы за сегодня\n"
         "/help - справка по использованию"
     )
-
     # Отправляем последние релизы за 3 дня
     recent_releases = get_recent_releases(3)
     if recent_releases:
@@ -425,11 +433,10 @@ async def start_command(message: Message):
 
 # --- КОМАНДА /today ---
 async def today_command(message: Message):
+    add_user(message.from_user.id)
     print(f"Пользователь {message.from_user.id} запрашивает релизы за сегодня")
-
     today = datetime.now(timezone.utc).date()
     today_releases = get_releases_by_date(today)
-
     if not today_releases:
         await message.answer("📭 Сегодня релизов не было.")
     else:
@@ -441,12 +448,11 @@ async def today_command(message: Message):
 
 # --- КОМАНДА /filter ---
 async def filter_command(message: Message):
+    add_user(message.from_user.id)
     print(f"Пользователь {message.from_user.id} хочет установить фильтры")
-
     # Создаем клавиатуру с кнопкой "Отмена"
     keyboard = InlineKeyboardBuilder()
     keyboard.button(text="❌ Отмена", callback_data="cancel_filter")
-
     await message.answer(
         "🔍 *Настройка фильтров*\n\n"
         "Введите ключевые слова через пробел, по которым будет производиться фильтрация релизов.\n"
@@ -459,9 +465,9 @@ async def filter_command(message: Message):
 
 # --- ОБРАБОТКА КНОПКИ ОТМЕНЫ ---
 async def cancel_filter_callback(callback: CallbackQuery):
+    add_user(callback.from_user.id)
     user_id = str(callback.from_user.id)
     print(f"Пользователь {user_id} отменил установку фильтров")
-
     await callback.message.edit_text(
         "❌ *Настройка фильтров отменена*",
         reply_markup=None
@@ -471,19 +477,16 @@ async def cancel_filter_callback(callback: CallbackQuery):
 
 # --- ОБРАБОТКА ТЕКСТА ПОСЛЕ /filter ---
 async def process_filter_text(message: Message):
+    add_user(message.from_user.id)
     user_id = str(message.from_user.id)
     keywords = message.text.strip().split()
-
     print(f"Пользователь {user_id} вводит фильтры: {keywords}")
-
     if not keywords:
         await message.answer("❌ Вы не ввели ключевые слова. Попробуйте снова.")
         return
-
     # Сохраняем фильтры
     user_filters[user_id] = keywords
     save_filters(user_filters)
-
     await message.answer(
         f"✅ *Фильтры сохранены!*\n\n"
         f"Ключевые слова: {', '.join(keywords)}\n\n"
@@ -493,11 +496,10 @@ async def process_filter_text(message: Message):
 
 # --- КОМАНДА /myfilters ---
 async def myfilters_command(message: Message):
+    add_user(message.from_user.id)
     user_id = str(message.from_user.id)
     filters = user_filters.get(user_id, [])
-
     print(f"Пользователь {user_id} запрашивает свои фильтры: {filters}")
-
     if not filters:
         await message.answer("📭 У вас нет установленных фильтров.")
     else:
@@ -509,10 +511,9 @@ async def myfilters_command(message: Message):
 
 # --- КОМАНДА /clearfilters ---
 async def clearfilters_command(message: Message):
+    add_user(message.from_user.id)
     user_id = str(message.from_user.id)
-
     print(f"Пользователь {user_id} очищает фильтры")
-
     if user_id in user_filters:
         del user_filters[user_id]
         save_filters(user_filters)
@@ -521,8 +522,30 @@ async def clearfilters_command(message: Message):
         await message.answer("📭 У вас и так не было установленных фильтров.")
 
 
+# --- КОМАНДА /stats (только для админа) ---
+async def stats_command(message: Message):
+    add_user(message.from_user.id)
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ У вас нет прав для выполнения этой команды.")
+        return
+
+    total_users = len(all_users)
+    users_with_filters = len(user_filters)
+
+    stats_message = (
+        f"📊 *Статистика бота:*\n\n"
+        f"👥 Всего пользователей: {total_users}\n"
+        f"🔍 Пользователей с фильтрами: {users_with_filters}\n"
+        f"📦 Репозиториев отслеживается: {len(REPOS)}\n"
+        f"📈 Релизов в истории: {len(releases_history)}"
+    )
+
+    await message.answer(stats_message, parse_mode="Markdown")
+
+
 # --- КОМАНДА /help ---
 async def help_command(message: Message):
+    add_user(message.from_user.id)
     print(f"Пользователь {message.from_user.id} запрашивает помощь")
     await message.answer(
         "📚 *Справка по использованию бота*\n\n"
@@ -556,35 +579,39 @@ def register_handlers(dp: Dispatcher):
     dp.message.register(clearfilters_command, Command("clearfilters"))
     dp.message.register(today_command, Command("today"))
     dp.message.register(help_command, Command("help"))
-
+    dp.message.register(stats_command, Command("stats"))
     # Обработка текста после команды /filter
     dp.message.register(process_filter_text, F.text & ~F.command)
-
     # Обработка кнопки "Отмена"
     dp.callback_query.register(cancel_filter_callback, F.data == "cancel_filter")
-
     print("Обработчики зарегистрированы")
 
 
 # --- MAIN ---
 async def main():
     print("=== Запуск бота ===")
-
     # Проверка наличия токена
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN не найден в файле .env!")
         print("ОШИБКА: BOT_TOKEN не найден в файле .env!")
         return
 
+    # Проверка формата CHANNEL_ID
+    if CHANNEL_ID and CHANNEL_ID.startswith("@https://"):
+        logger.warning("Неправильный формат CHANNEL_ID! Используйте @username или числовой ID канала.")
+        print(f"ПРЕДУПРЕЖДЕНИЕ: Неправильный формат CHANNEL_ID: {CHANNEL_ID}")
+        print("Используйте @username канала (например, @mychannel) или числовой ID (например, -1001234567890)")
+
+    # Игнорируем предупреждение о deprecated
+    warnings.filterwarnings("ignore", category=DeprecationWarning)
+
     print("Инициализация бота...")
     # Инициализация бота и диспетчера
     bot = Bot(token=BOT_TOKEN, parse_mode="Markdown")
     dp = Dispatcher()
-
     print("Регистрация обработчиков...")
     # Регистрация обработчиков
     register_handlers(dp)
-
     print("Настройка планировщика...")
     # Настройка планировщика
     scheduler = AsyncIOScheduler()
@@ -596,10 +623,8 @@ async def main():
         id='github_release_check'
     )
     scheduler.start()
-
     logger.info("Бот успешно запущен")
     print("=== Бот запущен и готов к работе ===")
-
     # Запускаем первоначальную проверку релизов
     print("Запускаю первоначальную проверку релизов...")
     try:
@@ -608,7 +633,6 @@ async def main():
     except Exception as e:
         logger.error(f"Ошибка при первоначальной проверке релизов: {e}")
         print(f"ОШИБКА при первоначальной проверке: {e}")
-
     # Запуск поллинга
     try:
         print("Начинаю получение обновлений...")
