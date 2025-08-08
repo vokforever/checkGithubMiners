@@ -2,7 +2,7 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Устанавливаем зависимости без лишних пакетов
+# Устанавливаем зависимости
 RUN apt-get update && apt-get install -y --no-install-recommends gcc && \
     rm -rf /var/lib/apt/lists/* && \
     apt-get clean
@@ -14,7 +14,7 @@ RUN pip install --no-cache-dir --user -r requirements.txt
 # Копируем приложение
 COPY . .
 
-# Устанавливаем права
+# Настраиваем права и директории
 RUN chmod +x main.py && mkdir -p data && chmod 755 data
 
 # Настраиваем окружение
