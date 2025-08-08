@@ -13,6 +13,8 @@ services:
       - CHANNEL_ID=${CHANNEL_ID}
       - ADMIN_ID=${ADMIN_ID}
       - CHECK_INTERVAL_MINUTES=${CHECK_INTERVAL_MINUTES:-60}
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app
     volumes:
       - bot_data:/app/data
       - ./.env:/app/.env:ro
@@ -25,7 +27,7 @@ services:
           memory: 256M
           cpus: '0.25'
     healthcheck:
-      test: ["CMD-SHELL", "python -c 'import sys; sys.exit(0)'"]
+      test: ["CMD-SHELL", "ls -la /app/main.py && python -c 'import sys; sys.exit(0)'"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -35,6 +37,11 @@ services:
     labels:
       - "coolify.managed=true"
       - "coolify.type=application"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   bot_data:
@@ -43,6 +50,3 @@ volumes:
 networks:
   bot-network:
     driver: bridge
-    ipam:
-      config:
-        - subnet: 172.20.0.0/24
