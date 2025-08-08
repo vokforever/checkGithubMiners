@@ -30,4 +30,4 @@ ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
 
 # Команда для запуска бота
-CMD ["python", "bot.py"]
+CMD ["python", "main.py"]
