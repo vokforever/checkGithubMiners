@@ -19,8 +19,8 @@ services:
     deploy:
       resources:
         limits:
-          memory: 768M    # Оптимально для 2GB RAM
-          cpus: '0.75'    # Оставляем ресурсы для системы
+          memory: 768M
+          cpus: '0.75'
         reservations:
           memory: 256M
           cpus: '0.25'
