@@ -2,25 +2,14 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Устанавливаем зависимости
-RUN apt-get update && apt-get install -y --no-install-recommends gcc && \
-    rm -rf /var/lib/apt/lists/* && \
-    apt-get clean
+# Устанавливаем зависимости напрямую (без requirements.txt)
+RUN pip install --no-cache-dir aiohttp==3.9.1 aiogram==3.6.0 apscheduler==3.10.4 beautifulsoup4==4.12.2 python-dotenv==1.0.0
 
-# Копируем requirements и устанавливаем зависимости
-COPY requirements.txt .
-RUN pip install --no-cache-dir --user -r requirements.txt
+# Копируем только main.py
+COPY main.py .
 
-# Копируем приложение
-COPY . .
-
-# Настраиваем права и директории
-RUN chmod +x main.py && mkdir -p data && chmod 755 data
-
-# Настраиваем окружение
-ENV PATH=/root/.local/bin:$PATH
-ENV PYTHONPATH=/app
-ENV PYTHONUNBUFFERED=1
+# Создаем директорию для данных
+RUN mkdir -p data
 
 # Команда запуска
 CMD ["python", "main.py"]
