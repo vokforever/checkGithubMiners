@@ -1,4 +1,4 @@
-version: '3.8'
+version: '3.9'
 
 services:
   github-release-bot:
@@ -14,22 +14,35 @@ services:
       - ADMIN_ID=${ADMIN_ID}
       - CHECK_INTERVAL_MINUTES=${CHECK_INTERVAL_MINUTES:-60}
     volumes:
-      - ./data:/app/data
+      - bot_data:/app/data
       - ./.env:/app/.env:ro
     deploy:
       resources:
         limits:
-          memory: 1.5G  # Ограничиваем память
-          cpus: '1.5'    # Ограничиваем CPU
+          memory: 768M    # Оптимально для 2GB RAM
+          cpus: '0.75'    # Оставляем ресурсы для системы
+        reservations:
+          memory: 256M
+          cpus: '0.25'
     healthcheck:
-      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
-      interval: 60s
-      timeout: 10s
+      test: ["CMD-SHELL", "python -c 'import sys; sys.exit(0)'"]
+      interval: 30s
+      timeout: 5s
       retries: 3
-      start_period: 30s
+      start_period: 40s
     networks:
       - bot-network
+    labels:
+      - "coolify.managed=true"
+      - "coolify.type=application"
+
+volumes:
+  bot_data:
+    driver: local
 
 networks:
   bot-network:
     driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
