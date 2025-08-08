@@ -27,7 +27,7 @@ DONATE_URL = "https://boosty.to/vokforever/donate"
 MAX_RETRIES = 3
 RETRY_DELAY = 2
 HISTORY_DAYS = 30
-PRIORITY_UPDATE_DAYS = 7  # Период для анализа частоты обновлений
+PRIORITY_UPDATE_DAYS = 7
 
 # --- СПИСОК РЕПОЗИТОРИЕВ ---
 REPOS = [
@@ -45,17 +45,17 @@ REPOS = [
 ]
 
 # --- ПАРАМЕТРЫ ПРИОРИТЕТНОЙ ПРОВЕРКИ ---
-MIN_CHECK_INTERVAL_MINUTES = 15  # Минимальный интервал проверки
-MAX_CHECK_INTERVAL_MINUTES = 1440  # Максимальный интервал (24 часа)
-PRIORITY_THRESHOLD_HIGH = 0.5  # Порог для высокой частоты обновлений (обновлений в день)
-PRIORITY_THRESHOLD_LOW = 0.1   # Порог для низкой частоты обновлений
+MIN_CHECK_INTERVAL_MINUTES = 15
+MAX_CHECK_INTERVAL_MINUTES = 1440
+PRIORITY_THRESHOLD_HIGH = 0.5
+PRIORITY_THRESHOLD_LOW = 0.1
 
 # --- ФАЙЛЫ ХРАНЕНИЯ ДАННЫХ ---
 STATE_FILE = "last_releases.json"
 FILTERS_FILE = "user_filters.json"
 HISTORY_FILE = "releases_history.json"
 USERS_FILE = "users.json"
-PRIORITY_FILE = "repo_priority.json"  # Файл для хранения приоритетов репозиториев
+PRIORITY_FILE = "repo_priority.json"
 
 # --- ЛОГИРОВАНИЕ ---
 logging.basicConfig(
@@ -79,17 +79,43 @@ class RepositoryPriorityManager:
         if os.path.exists(self.priority_file):
             try:
                 with open(self.priority_file, 'r') as f:
-                    return json.load(f)
+                    data = json.load(f)
+                    
+                    if isinstance(data, dict) and 'priorities' in data:
+                        priorities = data['priorities']
+                    else:
+                        priorities = data
+                    
+                    for repo in REPOS:
+                        if repo not in priorities:
+                            priorities[repo] = self._create_default_priority()
+                        else:
+                            for field in ['update_count', 'last_update', 'check_interval', 'priority_score', 'last_check']:
+                                if field not in priorities[repo]:
+                                    priorities[repo][field] = 0 if field == 'update_count' else None
+                    
+                    return priorities
             except (json.JSONDecodeError, IOError) as e:
                 logger.error(f"Ошибка загрузки приоритетов: {e}")
-        return {}
+                logger.info("Создание новых приоритетов по умолчанию")
+        
+        return {repo: self._create_default_priority() for repo in REPOS}
+    
+    def _create_default_priority(self) -> Dict:
+        return {
+            'update_count': 0,
+            'last_update': None,
+            'check_interval': BASE_CHECK_INTERVAL_MINUTES,
+            'priority_score': 0.0,
+            'last_check': None
+        }
     
     def _load_last_priority_update(self) -> Optional[datetime]:
         if os.path.exists(self.priority_file):
             try:
                 with open(self.priority_file, 'r') as f:
                     data = json.load(f)
-                    if 'last_update' in data:
+                    if isinstance(data, dict) and 'last_update' in data:
                         return datetime.fromisoformat(data['last_update'])
             except (json.JSONDecodeError, IOError, ValueError):
                 pass
@@ -99,22 +125,30 @@ class RepositoryPriorityManager:
         try:
             data = {
                 'priorities': self.priorities,
-                'last_update': datetime.now(timezone.utc).isoformat()
+                'last_update': datetime.now(timezone.utc).isoformat(),
+                'version': '1.0',
+                'repos_count': len(REPOS),
+                'created_at': datetime.now(timezone.utc).isoformat()
             }
+            
+            if os.path.exists(self.priority_file):
+                backup_file = f"{self.priority_file}.bak"
+                try:
+                    import shutil
+                    shutil.copy2(self.priority_file, backup_file)
+                except Exception as e:
+                    logger.warning(f"Не удалось создать резервную копию: {e}")
+            
             with open(self.priority_file, 'w') as f:
-                json.dump(data, f)
+                json.dump(data, f, indent=2)
+                
+            logger.debug(f"Приоритеты успешно сохранены в {self.priority_file}")
         except IOError as e:
             logger.error(f"Ошибка сохранения приоритетов: {e}")
     
     def get_priority(self, repo: str) -> Dict:
         if repo not in self.priorities:
-            # Инициализация приоритета по умолчанию
-            self.priorities[repo] = {
-                'update_count': 0,
-                'last_update': None,
-                'check_interval': BASE_CHECK_INTERVAL_MINUTES,
-                'priority_score': 0.0
-            }
+            self.priorities[repo] = self._create_default_priority()
             self._save_priorities()
         return self.priorities[repo]
     
@@ -123,6 +157,7 @@ class RepositoryPriorityManager:
         priority_data['update_count'] += 1
         priority_data['last_update'] = datetime.now(timezone.utc).isoformat()
         self._save_priorities()
+        logger.debug(f"Зарегистрировано обновление для {repo}. Всего обновлений: {priority_data['update_count']}")
     
     def should_update_priorities(self) -> bool:
         if not self.last_priority_update:
@@ -130,13 +165,12 @@ class RepositoryPriorityManager:
         return datetime.now(timezone.utc) - self.last_priority_update > timedelta(days=1)
     
     def update_priorities(self, history_manager):
-        """Обновление приоритетов на основе истории релизов"""
         logger.info("Обновление приоритетов репозиториев...")
         
         cutoff_date = datetime.now(timezone.utc) - timedelta(days=PRIORITY_UPDATE_DAYS)
+        updated_count = 0
         
         for repo in REPOS:
-            # Подсчет количества обновлений за период
             update_count = 0
             for rel in history_manager.history:
                 if rel['repo_name'] == repo:
@@ -147,34 +181,64 @@ class RepositoryPriorityManager:
                     except:
                         continue
             
-            # Расчет приоритета (обновлений в день)
             priority_score = update_count / PRIORITY_UPDATE_DAYS
             
-            # Определение интервала проверки
             if priority_score >= PRIORITY_THRESHOLD_HIGH:
                 check_interval = MIN_CHECK_INTERVAL_MINUTES
             elif priority_score <= PRIORITY_THRESHOLD_LOW:
                 check_interval = MAX_CHECK_INTERVAL_MINUTES
             else:
-                # Пропорциональное изменение интервала
                 ratio = (priority_score - PRIORITY_THRESHOLD_LOW) / (PRIORITY_THRESHOLD_HIGH - PRIORITY_THRESHOLD_LOW)
                 check_interval = int(MAX_CHECK_INTERVAL_MINUTES - ratio * (MAX_CHECK_INTERVAL_MINUTES - MIN_CHECK_INTERVAL_MINUTES))
             
-            # Обновление данных
-            self.priorities[repo] = {
+            existing_data = self.priorities.get(repo, {})
+            last_check = existing_data.get('last_check')
+            
+            new_priority_data = {
                 'update_count': update_count,
-                'last_update': None,
+                'last_update': existing_data.get('last_update'),
                 'check_interval': check_interval,
-                'priority_score': priority_score
+                'priority_score': round(priority_score, 3),
+                'last_check': last_check
             }
+            
+            if (repo not in self.priorities or 
+                self.priorities[repo]['check_interval'] != check_interval or
+                abs(self.priorities[repo]['priority_score'] - priority_score) > 0.001):
+                updated_count += 1
+            
+            self.priorities[repo] = new_priority_data
         
         self.last_priority_update = datetime.now(timezone.utc)
         self._save_priorities()
-        logger.info("Приоритеты обновлены")
         
-        # Логирование результатов
+        logger.info(f"Приоритеты обновлены. Изменено: {updated_count}/{len(REPOS)} репозиториев")
+        
         for repo, data in self.priorities.items():
-            logger.info(f"{repo}: интервал {data['check_interval']} мин, приоритет {data['priority_score']:.2f}")
+            status = "🔴" if data['priority_score'] >= PRIORITY_THRESHOLD_HIGH else \
+                    "🟢" if data['priority_score'] <= PRIORITY_THRESHOLD_LOW else "🟡"
+            logger.info(f"{status} {repo}: интервал {data['check_interval']} мин, приоритет {data['priority_score']:.3f}")
+    
+    def get_priority_stats(self) -> Dict:
+        stats = {
+            'high_priority': 0,
+            'medium_priority': 0,
+            'low_priority': 0,
+            'total_repos': len(REPOS)
+        }
+        
+        for repo in REPOS:
+            priority_data = self.get_priority(repo)
+            score = priority_data['priority_score']
+            
+            if score >= PRIORITY_THRESHOLD_HIGH:
+                stats['high_priority'] += 1
+            elif score <= PRIORITY_THRESHOLD_LOW:
+                stats['low_priority'] += 1
+            else:
+                stats['medium_priority'] += 1
+        
+        return stats
 
 # --- КЛАСС ДЛЯ УПРАВЛЕНИЯ ПОЛЬЗОВАТЕЛЯМИ ---
 class UserManager:
@@ -486,19 +550,11 @@ async def check_single_repo(bot: Bot, repo_name: str):
             if last_tag != current_tag:
                 logger.info(f"Найден новый релиз: {current_tag}")
                 
-                # Добавляем в историю
                 history_manager.add_release(repo_name, release)
-                
-                # Регистрируем обновление для приоритета
                 priority_manager.record_update(repo_name)
-                
-                # Отправляем уведомления
                 await send_notifications(bot, repo_name, release)
-                
-                # Обновляем состояние
                 state_manager.update_tag(repo_name, current_tag)
                 
-                # Логируем успешную проверку
                 logger.info(f"Успешно обработан новый релиз для {repo_name}")
             else:
                 logger.info(f"Обновлений для {repo_name} не найдено")
@@ -518,18 +574,15 @@ async def check_single_repo(bot: Bot, repo_name: str):
 async def check_repositories(bot: Bot):
     logger.info("Запуск проверки репозиториев с учетом приоритетов...")
     
-    # Обновляем приоритеты если нужно
     if priority_manager.should_update_priorities():
         priority_manager.update_priorities(history_manager)
     
-    # Проверяем репозитории в соответствии с их приоритетами
     current_time = datetime.now(timezone.utc)
     
     for repo_name in REPOS:
         priority_data = priority_manager.get_priority(repo_name)
         check_interval = priority_data['check_interval']
         
-        # Проверяем, нужно ли обновлять приоритеты для этого репозитория
         if priority_data.get('last_check'):
             last_check = datetime.fromisoformat(priority_data['last_check'])
             if current_time - last_check >= timedelta(minutes=check_interval):
@@ -537,7 +590,6 @@ async def check_repositories(bot: Bot):
                 priority_data['last_check'] = current_time.isoformat()
                 priority_manager._save_priorities()
         else:
-            # Если еще не было проверки, проверяем сейчас
             await check_single_repo(bot, repo_name)
             priority_data['last_check'] = current_time.isoformat()
             priority_manager._save_priorities()
@@ -593,6 +645,27 @@ async def priority_command(message: Message):
         priority_info += f"{repo}: {status} (интервал: {interval} мин, приоритет: {score:.2f})\n"
     
     await message.answer(priority_info, parse_mode="Markdown")
+
+# --- КОМАНДА /pstats ---
+async def pstats_command(message: Message):
+    user_manager.add_user(message.from_user.id)
+    
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ У вас нет прав для выполнения этой команды.")
+        return
+    
+    stats = priority_manager.get_priority_stats()
+    
+    stats_message = (
+        f"📊 *Статистика приоритетов репозиториев:*\n\n"
+        f"🔴 Высокий приоритет: {stats['high_priority']}\n"
+        f"🟡 Средний приоритет: {stats['medium_priority']}\n"
+        f"🟢 Низкий приоритет: {stats['low_priority']}\n"
+        f"📦 Всего репозиториев: {stats['total_repos']}\n\n"
+        f"🔄 Последнее обновление: {priority_manager.last_priority_update.strftime('%Y-%m-%d %H:%M') if priority_manager.last_priority_update else 'Еще не обновлялось'}"
+    )
+    
+    await message.answer(stats_message, parse_mode="Markdown")
 
 # --- КОМАНДА /today ---
 async def today_command(message: Message):
@@ -747,7 +820,8 @@ async def help_command(message: Message):
         "💝 *Поддержка проекта:*\n"
         "/donate - поддержать разработчика\n\n"
         "📊 *Приоритеты (для админа):*\n"
-        "/priority - показать приоритеты репозиториев\n\n"
+        "/priority - показать приоритеты репозиториев\n"
+        "/pstats - статистика приоритетов\n\n"
         "📌 *Как работает фильтрация:*\n"
         "Бот ищет ключевые слова в:\n"
         "• Названии релиза\n"
@@ -767,6 +841,7 @@ def register_handlers(dp: Dispatcher):
     dp.message.register(help_command, Command("help"))
     dp.message.register(stats_command, Command("stats"))
     dp.message.register(priority_command, Command("priority"))
+    dp.message.register(pstats_command, Command("pstats"))
     dp.message.register(donate_command, Command("donate"))
     dp.message.register(process_filter_text, F.text & ~F.command)
     dp.callback_query.register(cancel_filter_callback, F.data == "cancel_filter")
@@ -776,7 +851,6 @@ def register_handlers(dp: Dispatcher):
 async def main():
     print("=== Запуск бота ===")
     
-    # Проверка конфигурации
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN не найден в файле .env!")
         print("ОШИБКА: BOT_TOKEN не найден в файле .env!")
@@ -792,16 +866,14 @@ async def main():
     print("Настройка планировщика...")
     scheduler = AsyncIOScheduler()
     
-    # Основная задача проверки репозиториев с учетом приоритетов
     scheduler.add_job(
         check_repositories,
         'interval',
-        minutes=15,  # Проверяем каждые 15 минут, но каждый репозиторий в своем интервале
+        minutes=15,
         kwargs={'bot': bot},
         id='repositories_check'
     )
     
-    # Задача обновления приоритетов раз в день
     scheduler.add_job(
         lambda: priority_manager.update_priorities(history_manager),
         'interval',
