@@ -1,8 +1,8 @@
-version: '3.9'
+version: '3.8'
 
 services:
-  github-release-bot:
-    build: 
+  app:
+    build:
       context: .
       dockerfile: Dockerfile
     container_name: github-release-bot
@@ -13,40 +13,14 @@ services:
       - CHANNEL_ID=${CHANNEL_ID}
       - ADMIN_ID=${ADMIN_ID}
       - CHECK_INTERVAL_MINUTES=${CHECK_INTERVAL_MINUTES:-60}
-      - PYTHONUNBUFFERED=1
-      - PYTHONPATH=/app
     volumes:
-      - bot_data:/app/data
-      - ./.env:/app/.env:ro
-    deploy:
-      resources:
-        limits:
-          memory: 768M
-          cpus: '0.75'
-        reservations:
-          memory: 256M
-          cpus: '0.25'
-    healthcheck:
-      test: ["CMD-SHELL", "ls -la /app/main.py && python -c 'import sys; sys.exit(0)'"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 40s
+      - data:/app/data
     networks:
-      - bot-network
-    labels:
-      - "coolify.managed=true"
-      - "coolify.type=application"
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
+      - app-network
 
 volumes:
-  bot_data:
-    driver: local
+  data:
 
 networks:
-  bot-network:
+  app-network:
     driver: bridge
