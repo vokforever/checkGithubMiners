@@ -13,10 +13,15 @@ services:
       - CHANNEL_ID=${CHANNEL_ID}
       - ADMIN_ID=${ADMIN_ID}
       - CHECK_INTERVAL_MINUTES=${CHECK_INTERVAL_MINUTES:-60}
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app
     volumes:
       - data:/app/data
     networks:
       - app-network
+    labels:
+      - "coolify.managed=true"
+      - "coolify.type=application"
 
 volumes:
   data:
