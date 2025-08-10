@@ -5,8 +5,10 @@ import logging
 import sys
 import locale
 import ctypes
+import traceback
+import shutil
 from datetime import datetime, timezone, timedelta
-from typing import Dict, Optional, List, Set
+from typing import Dict, Optional, List, Set, Tuple
 from aiohttp import ClientSession, ClientError, ClientResponseError
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
@@ -26,8 +28,8 @@ if sys.platform == "win32":
     try:
         kernel32 = ctypes.windll.kernel32
         kernel32.SetConsoleOutputCP(65001)
-    except:
-        pass
+    except Exception as e:
+        print(f"Не удалось установить кодировку UTF-8: {e}")
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -37,7 +39,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", None)
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-# BASE_CHECK_INTERVAL_MINUTES убираем, чтобы система была полностью адаптивной
 DONATE_URL = "https://boosty.to/vokforever/donate"
 MAX_RETRIES = 3
 RETRY_DELAY = 2
@@ -47,7 +48,7 @@ PRIORITY_UPDATE_DAYS = 7
 # --- СПИСОК РЕПОЗИТОРИЕВ ---
 REPOS = [
     "andru-kun/wildrig-multi",
-    "OneZeroMiner/onezerominer",
+    "OneZeroMiner/onezerominer", 
     "trexminer/T-Rex",
     "xmrig/xmrig",
     "Lolliedieb/lolMiner-releases",
@@ -64,7 +65,7 @@ MIN_CHECK_INTERVAL_MINUTES = 15
 MAX_CHECK_INTERVAL_MINUTES = 1440
 PRIORITY_THRESHOLD_HIGH = 0.5
 PRIORITY_THRESHOLD_LOW = 0.1
-DEFAULT_CHECK_INTERVAL_MINUTES = 360  # 6 часов - средний интервал для новых репозиториев
+DEFAULT_CHECK_INTERVAL_MINUTES = 360  # 6 часов
 
 # --- ФАЙЛЫ ХРАНЕНИЯ ДАННЫХ ---
 STATE_FILE = "last_releases.json"
@@ -72,20 +73,122 @@ FILTERS_FILE = "user_filters.json"
 HISTORY_FILE = "releases_history.json"
 USERS_FILE = "users.json"
 PRIORITY_FILE = "repo_priority.json"
+STATISTICS_FILE = "bot_statistics.json"
 
-# --- ЛОГИРОВАНИЕ ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('bot.log', encoding='utf-8'),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger(__name__)
+# Создаем папку для резервных копий
+BACKUP_DIR = "backups"
+if not os.path.exists(BACKUP_DIR):
+    os.makedirs(BACKUP_DIR)
 
+# --- УЛУЧШЕННОЕ ЛОГИРОВАНИЕ ---
+def setup_logging():
+    """Настройка системы логирования"""
+    # Создаем папку для логов
+    log_dir = "logs"
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+    
+    # Настройка форматирования
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s'
+    )
+    
+    # Основной лог-файл
+    file_handler = logging.FileHandler(
+        f'{log_dir}/bot_{datetime.now().strftime("%Y%m%d")}.log', 
+        encoding='utf-8'
+    )
+    file_handler.setFormatter(formatter)
+    file_handler.setLevel(logging.INFO)
+    
+    # Лог ошибок
+    error_handler = logging.FileHandler(
+        f'{log_dir}/errors_{datetime.now().strftime("%Y%m%d")}.log',
+        encoding='utf-8'
+    )
+    error_handler.setFormatter(formatter)
+    error_handler.setLevel(logging.ERROR)
+    
+    # Консольный вывод
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    console_handler.setLevel(logging.INFO)
+    
+    # Настройка корневого логгера
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(error_handler)
+    root_logger.addHandler(console_handler)
+    
+    return logging.getLogger(__name__)
 
-# --- КЛАСС ДЛЯ УПРАВЛЕНИЯ ПРИОРИТЕТАМИ РЕПОЗИТОРИЕВ ---
+logger = setup_logging()
+
+# --- КЛАСС ДЛЯ УПРАВЛЕНИЯ СТАТИСТИКОЙ ---
+class StatisticsManager:
+    def __init__(self):
+        self.stats_file = STATISTICS_FILE
+        self.stats = self._load_stats()
+
+    def _load_stats(self) -> Dict:
+        if os.path.exists(self.stats_file):
+            try:
+                with open(self.stats_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError) as e:
+                logger.error(f"Ошибка загрузки статистики: {e}")
+        
+        return {
+            'total_checks': 0,
+            'total_releases_found': 0,
+            'total_notifications_sent': 0,
+            'errors_count': 0,
+            'start_time': datetime.now(timezone.utc).isoformat(),
+            'last_activity': None,
+            'repo_stats': {repo: {'checks': 0, 'releases': 0} for repo in REPOS}
+        }
+
+    def _save_stats(self):
+        try:
+            self.stats['last_activity'] = datetime.now(timezone.utc).isoformat()
+            with open(self.stats_file, 'w', encoding='utf-8') as f:
+                json.dump(self.stats, f, indent=2, ensure_ascii=False)
+        except IOError as e:
+            logger.error(f"Ошибка сохранения статистики: {e}")
+
+    def increment_checks(self, repo_name: str = None):
+        self.stats['total_checks'] += 1
+        if repo_name and repo_name in self.stats['repo_stats']:
+            self.stats['repo_stats'][repo_name]['checks'] += 1
+        self._save_stats()
+
+    def increment_releases(self, repo_name: str = None):
+        self.stats['total_releases_found'] += 1
+        if repo_name and repo_name in self.stats['repo_stats']:
+            self.stats['repo_stats'][repo_name]['releases'] += 1
+        self._save_stats()
+
+    def increment_notifications(self):
+        self.stats['total_notifications_sent'] += 1
+        self._save_stats()
+
+    def increment_errors(self):
+        self.stats['errors_count'] += 1
+        self._save_stats()
+
+    def get_uptime(self) -> str:
+        try:
+            start_time = datetime.fromisoformat(self.stats['start_time'])
+            uptime = datetime.now(timezone.utc) - start_time
+            days = uptime.days
+            hours, remainder = divmod(uptime.seconds, 3600)
+            minutes, _ = divmod(remainder, 60)
+            return f"{days}д {hours}ч {minutes}м"
+        except:
+            return "Неизвестно"
+
+# --- УЛУЧШЕННЫЙ КЛАСС ДЛЯ УПРАВЛЕНИЯ ПРИОРИТЕТАМИ ---
 class RepositoryPriorityManager:
     def __init__(self):
         self.priority_file = PRIORITY_FILE
@@ -103,19 +206,21 @@ class RepositoryPriorityManager:
                     else:
                         priorities = data
 
+                    # Обновляем структуру данных для всех репозиториев
                     for repo in REPOS:
                         if repo not in priorities:
                             priorities[repo] = self._create_default_priority()
                         else:
-                            for field in ['update_count', 'last_update', 'check_interval', 'priority_score',
-                                          'last_check']:
+                            # Добавляем недостающие поля
+                            default_priority = self._create_default_priority()
+                            for field, default_value in default_priority.items():
                                 if field not in priorities[repo]:
-                                    priorities[repo][field] = 0 if field == 'update_count' else None
+                                    priorities[repo][field] = default_value
 
                     return priorities
             except (json.JSONDecodeError, IOError) as e:
                 logger.error(f"Ошибка загрузки приоритетов: {e}")
-                logger.info("Создание новых приоритетов по умолчанию")
+                self._backup_corrupted_file(self.priority_file)
 
         return {repo: self._create_default_priority() for repo in REPOS}
 
@@ -123,9 +228,12 @@ class RepositoryPriorityManager:
         return {
             'update_count': 0,
             'last_update': None,
-            'check_interval': DEFAULT_CHECK_INTERVAL_MINUTES,  # Используем средний интервал по умолчанию
+            'check_interval': DEFAULT_CHECK_INTERVAL_MINUTES,
             'priority_score': 0.0,
-            'last_check': None
+            'last_check': None,
+            'consecutive_failures': 0,
+            'total_checks': 0,
+            'average_response_time': 0.0
         }
 
     def _load_last_priority_update(self) -> Optional[datetime]:
@@ -139,23 +247,32 @@ class RepositoryPriorityManager:
                 pass
         return None
 
+    def _backup_corrupted_file(self, file_path: str):
+        """Создает резервную копию поврежденного файла"""
+        try:
+            if os.path.exists(file_path):
+                backup_name = f"{os.path.basename(file_path)}.corrupted.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                backup_path = os.path.join(BACKUP_DIR, backup_name)
+                shutil.copy2(file_path, backup_path)
+                logger.warning(f"Создана резервная копия поврежденного файла: {backup_path}")
+        except Exception as e:
+            logger.error(f"Не удалось создать резервную копию: {e}")
+
     def _save_priorities(self):
         try:
+            # Создаем резервную копию перед сохранением
+            if os.path.exists(self.priority_file):
+                backup_file = f"{self.priority_file}.bak"
+                shutil.copy2(self.priority_file, backup_file)
+
             data = {
                 'priorities': self.priorities,
                 'last_update': datetime.now(timezone.utc).isoformat(),
-                'version': '1.0',
+                'version': '2.0',
                 'repos_count': len(REPOS),
-                'created_at': datetime.now(timezone.utc).isoformat()
+                'created_at': datetime.now(timezone.utc).isoformat(),
+                'backup_created': True
             }
-
-            if os.path.exists(self.priority_file):
-                backup_file = f"{self.priority_file}.bak"
-                try:
-                    import shutil
-                    shutil.copy2(self.priority_file, backup_file)
-                except Exception as e:
-                    logger.warning(f"Не удалось создать резервную копию: {e}")
 
             with open(self.priority_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
@@ -174,13 +291,34 @@ class RepositoryPriorityManager:
         priority_data = self.get_priority(repo)
         priority_data['update_count'] += 1
         priority_data['last_update'] = datetime.now(timezone.utc).isoformat()
+        priority_data['consecutive_failures'] = 0  # Сбрасываем счетчик ошибок
         self._save_priorities()
-        logger.debug(f"Зарегистрировано обновление для {repo}. Всего обновлений: {priority_data['update_count']}")
+        logger.info(f"Зарегистрировано обновление для {repo}. Всего обновлений: {priority_data['update_count']}")
+
+    def record_check(self, repo: str, success: bool = True, response_time: float = 0.0):
+        """Записывает информацию о проверке репозитория"""
+        priority_data = self.get_priority(repo)
+        priority_data['total_checks'] += 1
+        priority_data['last_check'] = datetime.now(timezone.utc).isoformat()
+        
+        if success:
+            priority_data['consecutive_failures'] = 0
+            # Обновляем среднее время отклика
+            if priority_data['average_response_time'] > 0:
+                priority_data['average_response_time'] = (
+                    priority_data['average_response_time'] + response_time
+                ) / 2
+            else:
+                priority_data['average_response_time'] = response_time
+        else:
+            priority_data['consecutive_failures'] += 1
+            
+        self._save_priorities()
 
     def should_update_priorities(self) -> bool:
         if not self.last_priority_update:
             return True
-        return datetime.now(timezone.utc) - self.last_priority_update > timedelta(days=1)
+        return datetime.now(timezone.utc) - self.last_priority_update > timedelta(hours=6)
 
     def update_priorities(self, history_manager):
         logger.info("Обновление приоритетов репозиториев...")
@@ -200,30 +338,33 @@ class RepositoryPriorityManager:
                         continue
 
             priority_score = update_count / PRIORITY_UPDATE_DAYS
+            existing_data = self.priorities.get(repo, self._create_default_priority())
 
-            if priority_score >= PRIORITY_THRESHOLD_HIGH:
+            # Учитываем количество последовательных неудач
+            failure_penalty = min(existing_data.get('consecutive_failures', 0) * 0.1, 0.5)
+            adjusted_score = max(0, priority_score - failure_penalty)
+
+            # Определяем интервал проверки
+            if adjusted_score >= PRIORITY_THRESHOLD_HIGH:
                 check_interval = MIN_CHECK_INTERVAL_MINUTES
-            elif priority_score <= PRIORITY_THRESHOLD_LOW:
+            elif adjusted_score <= PRIORITY_THRESHOLD_LOW:
                 check_interval = MAX_CHECK_INTERVAL_MINUTES
             else:
-                ratio = (priority_score - PRIORITY_THRESHOLD_LOW) / (PRIORITY_THRESHOLD_HIGH - PRIORITY_THRESHOLD_LOW)
+                ratio = (adjusted_score - PRIORITY_THRESHOLD_LOW) / (PRIORITY_THRESHOLD_HIGH - PRIORITY_THRESHOLD_LOW)
                 check_interval = int(
-                    MAX_CHECK_INTERVAL_MINUTES - ratio * (MAX_CHECK_INTERVAL_MINUTES - MIN_CHECK_INTERVAL_MINUTES))
-
-            existing_data = self.priorities.get(repo, {})
-            last_check = existing_data.get('last_check')
+                    MAX_CHECK_INTERVAL_MINUTES - ratio * (MAX_CHECK_INTERVAL_MINUTES - MIN_CHECK_INTERVAL_MINUTES)
+                )
 
             new_priority_data = {
+                **existing_data,
                 'update_count': update_count,
-                'last_update': existing_data.get('last_update'),
                 'check_interval': check_interval,
-                'priority_score': round(priority_score, 3),
-                'last_check': last_check
+                'priority_score': round(adjusted_score, 3)
             }
 
             if (repo not in self.priorities or
-                    self.priorities[repo]['check_interval'] != check_interval or
-                    abs(self.priorities[repo]['priority_score'] - priority_score) > 0.001):
+                    abs(self.priorities[repo]['check_interval'] - check_interval) > 5 or
+                    abs(self.priorities[repo]['priority_score'] - adjusted_score) > 0.01):
                 updated_count += 1
 
             self.priorities[repo] = new_priority_data
@@ -233,23 +374,34 @@ class RepositoryPriorityManager:
 
         logger.info(f"Приоритеты обновлены. Изменено: {updated_count}/{len(REPOS)} репозиториев")
 
+        # Детальный лог приоритетов
         for repo, data in self.priorities.items():
             status = "🔴" if data['priority_score'] >= PRIORITY_THRESHOLD_HIGH else \
                 "🟢" if data['priority_score'] <= PRIORITY_THRESHOLD_LOW else "🟡"
+            failures = data.get('consecutive_failures', 0)
+            failure_info = f" ⚠️{failures}" if failures > 0 else ""
             logger.info(
-                f"{status} {repo}: интервал {data['check_interval']} мин, приоритет {data['priority_score']:.3f}")
+                f"{status} {repo}: интервал {data['check_interval']} мин, "
+                f"приоритет {data['priority_score']:.3f}{failure_info}"
+            )
 
     def get_priority_stats(self) -> Dict:
         stats = {
             'high_priority': 0,
             'medium_priority': 0,
             'low_priority': 0,
-            'total_repos': len(REPOS)
+            'failing_repos': 0,
+            'total_repos': len(REPOS),
+            'average_interval': 0,
+            'total_checks': 0,
+            'total_updates': 0
         }
 
+        total_interval = 0
         for repo in REPOS:
             priority_data = self.get_priority(repo)
             score = priority_data['priority_score']
+            failures = priority_data.get('consecutive_failures', 0)
 
             if score >= PRIORITY_THRESHOLD_HIGH:
                 stats['high_priority'] += 1
@@ -258,42 +410,133 @@ class RepositoryPriorityManager:
             else:
                 stats['medium_priority'] += 1
 
+            if failures > 3:
+                stats['failing_repos'] += 1
+
+            total_interval += priority_data['check_interval']
+            stats['total_checks'] += priority_data.get('total_checks', 0)
+            stats['total_updates'] += priority_data.get('update_count', 0)
+
+        stats['average_interval'] = round(total_interval / len(REPOS), 1)
         return stats
 
-
-# --- КЛАСС ДЛЯ УПРАВЛЕНИЯ ПОЛЬЗОВАТЕЛЯМИ ---
+# --- УЛУЧШЕННЫЙ КЛАСС ДЛЯ УПРАВЛЕНИЯ ПОЛЬЗОВАТЕЛЯМИ ---
 class UserManager:
     def __init__(self):
         self.users_file = USERS_FILE
-        self.users = self._load_users()
+        self.users_data = self._load_users()
 
-    def _load_users(self) -> Set[int]:
+    def _load_users(self) -> Dict[int, Dict]:
         if os.path.exists(self.users_file):
             try:
                 with open(self.users_file, 'r', encoding='utf-8') as f:
-                    return set(json.load(f))
+                    data = json.load(f)
+                    
+                    # Если старый формат (только список ID), конвертируем
+                    if isinstance(data, list):
+                        return {user_id: self._create_user_data() for user_id in data}
+                    elif isinstance(data, dict):
+                        # Дополняем недостающие поля
+                        for user_id, user_data in data.items():
+                            if not isinstance(user_data, dict):
+                                data[user_id] = self._create_user_data()
+                            else:
+                                default_data = self._create_user_data()
+                                for field, default_value in default_data.items():
+                                    if field not in user_data:
+                                        user_data[field] = default_value
+                        return {int(k): v for k, v in data.items()}
+                    
             except (json.JSONDecodeError, IOError) as e:
                 logger.error(f"Ошибка загрузки пользователей: {e}")
-        return set()
+        
+        return {}
+
+    def _create_user_data(self) -> Dict:
+        return {
+            'joined_at': datetime.now(timezone.utc).isoformat(),
+            'last_activity': None,
+            'notifications_received': 0,
+            'commands_used': 0,
+            'is_active': True
+        }
 
     def _save_users(self):
         try:
+            # Резервная копия
+            if os.path.exists(self.users_file):
+                backup_file = f"{self.users_file}.bak"
+                shutil.copy2(self.users_file, backup_file)
+
             with open(self.users_file, 'w', encoding='utf-8') as f:
-                json.dump(list(self.users), f, ensure_ascii=False)
+                json.dump(self.users_data, f, ensure_ascii=False, indent=2)
         except IOError as e:
             logger.error(f"Ошибка сохранения пользователей: {e}")
 
-    def add_user(self, user_id: int):
-        if user_id not in self.users:
-            self.users.add(user_id)
+    def add_user(self, user_id: int, username: str = None):
+        if user_id not in self.users_data:
+            self.users_data[user_id] = self._create_user_data()
+            if username:
+                self.users_data[user_id]['username'] = username
             self._save_users()
-            logger.info(f"Новый пользователь: {user_id}")
+            logger.info(f"Новый пользователь: {user_id} ({username})")
+        else:
+            # Обновляем активность
+            self.users_data[user_id]['last_activity'] = datetime.now(timezone.utc).isoformat()
+            if username and 'username' not in self.users_data[user_id]:
+                self.users_data[user_id]['username'] = username
+                self._save_users()
+
+    def record_activity(self, user_id: int, activity_type: str = 'command'):
+        if user_id in self.users_data:
+            self.users_data[user_id]['last_activity'] = datetime.now(timezone.utc).isoformat()
+            if activity_type == 'command':
+                self.users_data[user_id]['commands_used'] += 1
+            elif activity_type == 'notification':
+                self.users_data[user_id]['notifications_received'] += 1
+            self._save_users()
+
+    def get_users(self) -> Set[int]:
+        return set(self.users_data.keys())
+
+    def get_active_users(self, days: int = 30) -> Set[int]:
+        """Возвращает активных пользователей за последние N дней"""
+        cutoff_date = datetime.now(timezone.utc) - timedelta(days=days)
+        active_users = set()
+        
+        for user_id, user_data in self.users_data.items():
+            if user_data.get('is_active', True):
+                last_activity = user_data.get('last_activity')
+                if last_activity:
+                    try:
+                        activity_date = datetime.fromisoformat(last_activity)
+                        if activity_date >= cutoff_date:
+                            active_users.add(user_id)
+                    except:
+                        # Если не можем распарсить дату, считаем пользователя активным
+                        active_users.add(user_id)
+                else:
+                    # Новые пользователи без активности считаются активными
+                    active_users.add(user_id)
+        
+        return active_users
 
     def get_count(self) -> int:
-        return len(self.users)
+        return len(self.users_data)
 
+    def get_stats(self) -> Dict:
+        active_users = len(self.get_active_users(30))
+        total_commands = sum(data.get('commands_used', 0) for data in self.users_data.values())
+        total_notifications = sum(data.get('notifications_received', 0) for data in self.users_data.values())
+        
+        return {
+            'total_users': len(self.users_data),
+            'active_users_30d': active_users,
+            'total_commands': total_commands,
+            'total_notifications': total_notifications
+        }
 
-# --- КЛАСС ДЛЯ УПРАВЛЕНИЯ СОСТОЯНИЕМ РЕЛИЗОВ ---
+# --- ОСТАЛЬНЫЕ КЛАССЫ ОСТАЮТСЯ БЕЗ ИЗМЕНЕНИЙ, НО С УЛУЧШЕНИЯМИ ---
 class ReleaseStateManager:
     def __init__(self):
         self.state_file = STATE_FILE
@@ -306,24 +549,40 @@ class ReleaseStateManager:
                     return json.load(f)
             except (json.JSONDecodeError, IOError) as e:
                 logger.error(f"Ошибка загрузки состояния: {e}")
+                self._backup_corrupted_file()
         return {}
+
+    def _backup_corrupted_file(self):
+        """Создает резервную копию поврежденного файла состояния"""
+        try:
+            if os.path.exists(self.state_file):
+                backup_name = f"state_corrupted_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                backup_path = os.path.join(BACKUP_DIR, backup_name)
+                shutil.copy2(self.state_file, backup_path)
+                logger.warning(f"Создана резервная копия состояния: {backup_path}")
+        except Exception as e:
+            logger.error(f"Не удалось создать резервную копию состояния: {e}")
 
     def _save_state(self):
         try:
+            # Резервная копия
+            if os.path.exists(self.state_file):
+                backup_file = f"{self.state_file}.bak"
+                shutil.copy2(self.state_file, backup_file)
+
             with open(self.state_file, 'w', encoding='utf-8') as f:
-                json.dump(self.state, f, ensure_ascii=False)
+                json.dump(self.state, f, ensure_ascii=False, indent=2)
         except IOError as e:
             logger.error(f"Ошибка сохранения состояния: {e}")
 
     def update_tag(self, repo: str, tag: str):
         self.state[repo] = tag
         self._save_state()
+        logger.debug(f"Обновлен тег для {repo}: {tag}")
 
     def get_last_tag(self, repo: str) -> Optional[str]:
         return self.state.get(repo)
 
-
-# --- КЛАСС ДЛЯ УПРАВЛЕНИЯ ФИЛЬТРАМИ ---
 class FilterManager:
     def __init__(self):
         self.filters_file = FILTERS_FILE
@@ -340,14 +599,23 @@ class FilterManager:
 
     def _save_filters(self):
         try:
+            # Резервная копия
+            if os.path.exists(self.filters_file):
+                backup_file = f"{self.filters_file}.bak"
+                shutil.copy2(self.filters_file, backup_file)
+
             with open(self.filters_file, 'w', encoding='utf-8') as f:
-                json.dump(self.filters, f, ensure_ascii=False)
+                json.dump(self.filters, f, ensure_ascii=False, indent=2)
         except IOError as e:
             logger.error(f"Ошибка сохранения фильтров: {e}")
 
     def set_filters(self, user_id: str, keywords: List[str]):
-        self.filters[user_id] = keywords
-        self._save_filters()
+        # Нормализуем ключевые слова
+        normalized_keywords = [keyword.strip().lower() for keyword in keywords if keyword.strip()]
+        if normalized_keywords:
+            self.filters[user_id] = normalized_keywords
+            self._save_filters()
+            logger.info(f"Установлены фильтры для пользователя {user_id}: {normalized_keywords}")
 
     def get_filters(self, user_id: str) -> List[str]:
         return self.filters.get(user_id, [])
@@ -356,12 +624,23 @@ class FilterManager:
         if user_id in self.filters:
             del self.filters[user_id]
             self._save_filters()
+            logger.info(f"Очищены фильтры для пользователя {user_id}")
 
     def get_users_with_filters_count(self) -> int:
         return len(self.filters)
 
+    def get_stats(self) -> Dict:
+        total_filters = len(self.filters)
+        avg_keywords = 0
+        if total_filters > 0:
+            total_keywords = sum(len(keywords) for keywords in self.filters.values())
+            avg_keywords = round(total_keywords / total_filters, 1)
+        
+        return {
+            'users_with_filters': total_filters,
+            'average_keywords_per_user': avg_keywords
+        }
 
-# --- КЛАСС ДЛЯ УПРАВЛЕНИЯ ИСТОРИЕЙ РЕЛИЗОВ ---
 class ReleaseHistoryManager:
     def __init__(self):
         self.history_file = HISTORY_FILE
@@ -378,19 +657,31 @@ class ReleaseHistoryManager:
 
     def _save_history(self):
         try:
+            # Очистка старых записей
             cutoff_date = datetime.now(timezone.utc) - timedelta(days=HISTORY_DAYS)
             filtered_history = [
                 rel for rel in self.history
                 if datetime.fromisoformat(rel['published_at'].replace('Z', '+00:00')) >= cutoff_date
             ]
 
+            # Резервная копия
+            if os.path.exists(self.history_file):
+                backup_file = f"{self.history_file}.bak"
+                shutil.copy2(self.history_file, backup_file)
+
             with open(self.history_file, 'w', encoding='utf-8') as f:
                 json.dump(filtered_history, f, ensure_ascii=False, indent=2)
+            
+            removed_count = len(self.history) - len(filtered_history)
+            if removed_count > 0:
+                logger.info(f"Удалено {removed_count} старых записей из истории")
+                
             self.history = filtered_history
         except IOError as e:
             logger.error(f"Ошибка сохранения истории: {e}")
 
     def add_release(self, repo_name: str, release: Dict):
+        # Проверяем, не существует ли уже такой релиз
         exists = any(
             rel['repo_name'] == repo_name and rel['tag_name'] == release.get('tag_name')
             for rel in self.history
@@ -402,117 +693,199 @@ class ReleaseHistoryManager:
                 'tag_name': release.get('tag_name'),
                 'name': release.get('name'),
                 'published_at': release.get('published_at'),
-                'body': release.get('body'),
-                'assets': release.get('assets', [])
+                'body': release.get('body', ''),
+                'assets': release.get('assets', []),
+                'added_to_history': datetime.now(timezone.utc).isoformat()
             }
             self.history.append(history_entry)
             self._save_history()
             logger.info(f"Добавлен релиз в историю: {repo_name} {release.get('tag_name')}")
+            return True
+        return False
 
     def get_releases_by_date(self, target_date) -> List[Dict]:
-        logger.info(f"Ищем релизы за дату: {target_date}")
+        logger.info(f"Поиск релизов за дату: {target_date}")
 
         result = []
         for rel in self.history:
             try:
-                # Преобразуем дату публикации в UTC и сравниваем с целевой датой
                 pub_date_str = rel['published_at']
                 if pub_date_str.endswith('Z'):
                     pub_date_str = pub_date_str[:-1] + '+00:00'
 
                 pub_date = datetime.fromisoformat(pub_date_str).astimezone(timezone.utc).date()
-                logger.info(f"Релиз {rel['repo_name']} {rel['tag_name']} опубликован {pub_date} (цель: {target_date})")
-
+                
                 if pub_date == target_date:
                     result.append(rel)
             except Exception as e:
                 logger.error(f"Ошибка при обработке даты релиза {rel['repo_name']} {rel['tag_name']}: {e}")
 
         logger.info(f"Найдено {len(result)} релизов за дату {target_date}")
-        return result
+        return sorted(result, key=lambda x: x['published_at'], reverse=True)
 
     def get_recent_releases(self, days: int = 3) -> List[Dict]:
         cutoff_date = datetime.now(timezone.utc).date() - timedelta(days=days)
-        releases = [
-            rel for rel in self.history
-            if datetime.fromisoformat(rel['published_at'].replace('Z', '+00:00')).date() >= cutoff_date
-        ]
+        releases = []
+        
+        for rel in self.history:
+            try:
+                pub_date_str = rel['published_at']
+                if pub_date_str.endswith('Z'):
+                    pub_date_str = pub_date_str[:-1] + '+00:00'
+                
+                pub_date = datetime.fromisoformat(pub_date_str).date()
+                if pub_date >= cutoff_date:
+                    releases.append(rel)
+            except Exception as e:
+                logger.error(f"Ошибка обработки даты релиза: {e}")
+                continue
+        
         return sorted(releases, key=lambda x: x['published_at'], reverse=True)
 
     def get_count(self) -> int:
         return len(self.history)
 
+    def get_stats(self) -> Dict:
+        if not self.history:
+            return {'total_releases': 0, 'releases_by_repo': {}, 'releases_last_7_days': 0}
+        
+        releases_by_repo = {}
+        recent_releases = 0
+        cutoff_date = datetime.now(timezone.utc) - timedelta(days=7)
+        
+        for rel in self.history:
+            repo = rel['repo_name']
+            releases_by_repo[repo] = releases_by_repo.get(repo, 0) + 1
+            
+            try:
+                pub_date_str = rel['published_at']
+                if pub_date_str.endswith('Z'):
+                    pub_date_str = pub_date_str[:-1] + '+00:00'
+                pub_date = datetime.fromisoformat(pub_date_str)
+                if pub_date >= cutoff_date:
+                    recent_releases += 1
+            except:
+                pass
+        
+        return {
+            'total_releases': len(self.history),
+            'releases_by_repo': releases_by_repo,
+            'releases_last_7_days': recent_releases
+        }
 
 # --- ИНИЦИАЛИЗАЦИЯ МЕНЕДЖЕРОВ ---
+statistics_manager = StatisticsManager()
 user_manager = UserManager()
 state_manager = ReleaseStateManager()
 filter_manager = FilterManager()
 history_manager = ReleaseHistoryManager()
 priority_manager = RepositoryPriorityManager()
 
-
-# --- ЗАГРУЗКА ИНФЫ О РЕЛИЗАХ ---
-async def fetch_release(session: ClientSession, repo_name: str) -> Optional[Dict]:
+# --- УЛУЧШЕННАЯ ЗАГРУЗКА ИНФОРМАЦИИ О РЕЛИЗАХ ---
+async def fetch_release(session: ClientSession, repo_name: str) -> Tuple[Optional[Dict], float]:
+    """Загружает информацию о последнем релизе репозитория
+    
+    Returns:
+        Tuple[Optional[Dict], float]: (данные релиза, время отклика в секундах)
+    """
     api_url = f"https://api.github.com/repos/{repo_name}/releases/latest"
-    headers = {}
+    headers = {'User-Agent': 'GitHub-Release-Monitor-Bot'}
+    
     if GITHUB_TOKEN:
         headers['Authorization'] = f'token {GITHUB_TOKEN}'
 
+    start_time = asyncio.get_event_loop().time()
+    
     for attempt in range(MAX_RETRIES):
         try:
-            async with session.get(api_url, headers=headers) as response:
+            async with session.get(api_url, headers=headers, timeout=30) as response:
+                response_time = asyncio.get_event_loop().time() - start_time
+                
                 if response.status == 200:
-                    return await response.json()
+                    data = await response.json()
+                    logger.debug(f"Успешно получены данные для {repo_name} за {response_time:.2f}с")
+                    return data, response_time
                 elif response.status == 403:
+                    # Rate limit
                     reset_time = int(response.headers.get('X-RateLimit-Reset', 0))
                     current_time = int(datetime.now().timestamp())
                     wait_time = max(reset_time - current_time, 60)
-                    logger.warning(f"Rate limit exceeded. Waiting {wait_time} seconds")
+                    logger.warning(f"Rate limit для {repo_name}. Ожидание {wait_time} секунд")
                     await asyncio.sleep(wait_time)
                     continue
                 elif response.status == 404:
-                    logger.error(f"Repository not found via API: {repo_name}")
-                    return None
+                    logger.error(f"Репозиторий не найден: {repo_name}")
+                    return None, response_time
                 else:
-                    logger.error(f"Unexpected status {response.status} for {repo_name}")
-                    return None
+                    logger.error(f"Неожиданный статус {response.status} для {repo_name}")
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(RETRY_DELAY * (attempt + 1))
+                        continue
+                    return None, response_time
+                    
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout при запросе к {repo_name} (попытка {attempt + 1})")
         except (ClientError, ClientResponseError) as e:
-            logger.error(f"Request failed (attempt {attempt + 1}): {e}")
-            if attempt < MAX_RETRIES - 1:
-                await asyncio.sleep(RETRY_DELAY * (attempt + 1))
-            else:
-                return None
-    return None
+            logger.error(f"Ошибка запроса к {repo_name} (попытка {attempt + 1}): {e}")
+        except Exception as e:
+            logger.error(f"Неожиданная ошибка при запросе к {repo_name}: {e}")
+            
+        if attempt < MAX_RETRIES - 1:
+            await asyncio.sleep(RETRY_DELAY * (attempt + 1))
+    
+    response_time = asyncio.get_event_loop().time() - start_time
+    return None, response_time
 
-
-# --- ПРОВЕРКА СООТВЕТСТВИЯ ФИЛЬТРАМ ---
+# --- УЛУЧШЕННАЯ ПРОВЕРКА СООТВЕТСТВИЯ ФИЛЬТРАМ ---
 def matches_filters(release_data: dict, keywords: List[str]) -> bool:
+    """Проверяет соответствие релиза фильтрам пользователя"""
     if not keywords:
         return True
 
-    search_text = " ".join([
+    # Создаем текст для поиска
+    search_fields = [
         release_data.get('name', ''),
         release_data.get('tag_name', ''),
         release_data.get('body', '')
-    ]).lower()
+    ]
+    
+    # Добавляем имена файлов для скачивания
+    for asset in release_data.get('assets', []):
+        if isinstance(asset, dict):
+            search_fields.append(asset.get('name', ''))
 
+    search_text = " ".join(search_fields).lower()
+
+    # Проверяем наличие всех ключевых слов
     return all(keyword.lower() in search_text for keyword in keywords)
-
 
 # --- ЭКРАНИРОВАНИЕ СИМВОЛОВ MARKDOWN ---
 def escape_markdown(text: str) -> str:
-    escape_chars = '_*`[]()'
-    return ''.join(f'\\{char}' if char in escape_chars else char for char in text)
+    """Экранирует специальные символы Markdown"""
+    if not text:
+        return ""
+    
+    escape_chars = '_*`[]()~>#+-=|{}.!'
+    escaped_text = ""
+    
+    for char in text:
+        if char in escape_chars:
+            escaped_text += f'\\{char}'
+        else:
+            escaped_text += char
+    
+    return escaped_text
 
-
-# --- ФОРМАТИРОВАНИЕ СООБЩЕНИЯ ---
+# --- УЛУЧШЕННОЕ ФОРМАТИРОВАНИЕ СООБЩЕНИЯ ---
 def format_release_message(repo_name: str, release: Dict) -> str:
+    """Форматирует сообщение о релизе"""
     tag = release.get('tag_name', 'Unknown')
     name = release.get('name', tag)
     body = release.get('body', '')
     published_at = release.get('published_at', '')
     assets = release.get('assets', [])
 
+    # Экранируем текст
     repo_name_escaped = escape_markdown(repo_name)
     name_escaped = escape_markdown(name)
     tag_escaped = escape_markdown(tag)
@@ -523,532 +896,1528 @@ def format_release_message(repo_name: str, release: Dict) -> str:
         f"`{tag_escaped}`\n"
     )
 
+    # Добавляем дату публикации
     if published_at:
         try:
             pub_date = datetime.fromisoformat(published_at.replace('Z', '+00:00'))
-            message += f"📅 {pub_date.strftime('%Y-%m-%d %H:%M')}\n\n"
-        except:
+            formatted_date = pub_date.strftime('%Y-%m-%d %H:%M UTC')
+            message += f"📅 {formatted_date}\n\n"
+        except Exception as e:
+            logger.warning(f"Не удалось распарсить дату: {published_at}, ошибка: {e}")
             message += "\n"
     else:
         message += "\n"
 
+    # Добавляем описание (с ограничением длины)
     if body:
-        body_escaped = escape_markdown(body[:1000])
-        message += f"{body_escaped}{'...' if len(body) > 1000 else ''}\n\n"
+        # Убираем лишние символы и ограничиваем длину
+        body_clean = body.strip()
+        if len(body_clean) > 1000:
+            body_clean = body_clean[:1000] + "..."
+        
+        body_escaped = escape_markdown(body_clean)
+        message += f"{body_escaped}\n\n"
 
-    links = []
+    # Добавляем ссылки для скачивания
+    download_links = []
     for asset in assets:
-        asset_name = asset.get('name', '')
-        download_url = asset.get('browser_download_url', '')
-        if asset_name and download_url and not asset_name.startswith("Source code"):
-            asset_name_escaped = escape_markdown(asset_name)
-            links.append(f"[{asset_name_escaped}]({download_url})")
+        if isinstance(asset, dict):
+            asset_name = asset.get('name', '')
+            download_url = asset.get('browser_download_url', '')
+            
+            # Исключаем исходный код
+            if (asset_name and download_url and 
+                not asset_name.startswith("Source code") and
+                not asset_name.endswith(".zip") or not asset_name.endswith(".tar.gz")):
+                
+                asset_name_escaped = escape_markdown(asset_name[:50])  # Ограничиваем длину имени
+                download_links.append(f"[{asset_name_escaped}]({download_url})")
 
-    if links:
-        message += "📥 *Ссылки для скачивания:*\n" + "\n".join(links)
+    if download_links:
+        message += "📥 *Ссылки для скачивания:*\n" + "\n".join(download_links[:10])  # Максимум 10 ссылок
     else:
         message += "⚠️ Файлы для скачивания не найдены"
 
+    # Добавляем ссылку на релиз
+    release_url = release.get('html_url')
+    if release_url:
+        message += f"\n\n🔗 [Открыть на GitHub]({release_url})"
+
     return message
 
-
-# --- ОТПРАВКА УВЕДОМЛЕНИЙ ---
-async def send_notifications(bot: Bot, repo_name: str, release: Dict):
+# --- ЗНАЧИТЕЛЬНО УЛУЧШЕННАЯ ОТПРАВКА УВЕДОМЛЕНИЙ ---
+async def send_notifications(bot: Bot, repo_name: str, release: Dict) -> int:
+    """Отправляет уведомления о новом релизе
+    
+    Returns:
+        int: Количество успешно отправленных уведомлений
+    """
     message = format_release_message(repo_name, release)
-    notified_users = set()
+    notifications_sent = 0
+    
+    # Получаем всех пользователей и их фильтры
+    all_users = user_manager.get_active_users(30)  # Только активные пользователи за последние 30 дней
+    users_with_filters = set(int(uid) for uid in filter_manager.filters.keys())
+    users_without_filters = all_users - users_with_filters
 
-    for user_id, filters in filter_manager.filters.items():
-        if matches_filters(release, filters):
-            try:
-                await bot.send_message(user_id, message, parse_mode="Markdown")
-                notified_users.add(user_id)
-                logger.info(f"Уведомление отправлено пользователю {user_id} для {repo_name}")
-            except Exception as e:
-                logger.error(f"Ошибка отправки сообщения пользователю {user_id}: {e}")
+    logger.info(f"Отправка уведомлений для {repo_name}: "
+                f"всего активных пользователей {len(all_users)}, "
+                f"с фильтрами {len(users_with_filters)}, "
+                f"без фильтров {len(users_without_filters)}")
 
-    if not notified_users and CHANNEL_ID:
+    # 1. Отправляем пользователям с фильтрами (если релиз подходит под фильтры)
+    for user_id_str, filters in filter_manager.filters.items():
+        try:
+            user_id = int(user_id_str)
+            
+            # Проверяем, что пользователь активен
+            if user_id not in all_users:
+                continue
+                
+            if matches_filters(release, filters):
+                try:
+                    await bot.send_message(user_id, message, parse_mode="Markdown")
+                    notifications_sent += 1
+                    user_manager.record_activity(user_id, 'notification')
+                    logger.info(f"✅ Уведомление отправлено пользователю {user_id} (фильтры)")
+                except Exception as e:
+                    logger.error(f"❌ Ошибка отправки пользователю {user_id}: {e}")
+                    
+        except ValueError:
+            logger.error(f"Некорректный ID пользователя в фильтрах: {user_id_str}")
+            continue
+
+    # 2. Отправляем пользователям БЕЗ фильтров (они получают ВСЕ релизы)
+    for user_id in users_without_filters:
+        try:
+            await bot.send_message(user_id, message, parse_mode="Markdown")
+            notifications_sent += 1
+            user_manager.record_activity(user_id, 'notification')
+            logger.info(f"✅ Уведомление отправлено пользователю {user_id} (без фильтров)")
+        except Exception as e:
+            logger.error(f"❌ Ошибка отправки пользователю {user_id}: {e}")
+
+    # 3. Отправляем в канал (если указан)
+    if CHANNEL_ID:
         try:
             await bot.send_message(CHANNEL_ID, message, parse_mode="Markdown")
-            logger.info(f"Уведомление отправлено в канал для {repo_name}")
+            logger.info(f"✅ Уведомление отправлено в канал {CHANNEL_ID}")
+            notifications_sent += 1
         except Exception as e:
-            logger.error(f"Ошибка отправки сообщения в канал: {e}")
+            logger.error(f"❌ Ошибка отправки в канал {CHANNEL_ID}: {e}")
 
+    # Обновляем статистику
+    if notifications_sent > 0:
+        statistics_manager.increment_notifications()
+        statistics_manager.increment_releases(repo_name)
 
-# --- ПРОВЕРКА ОДНОГО РЕПОЗИТОРИЯ ---
-async def check_single_repo(bot: Bot, repo_name: str):
-    logger.info(f"Проверка репозитория: {repo_name}")
+    logger.info(f"Отправлено {notifications_sent} уведомлений для {repo_name}")
+    return notifications_sent
 
+# --- УЛУЧШЕННАЯ ПРОВЕРКА ОДНОГО РЕПОЗИТОРИЯ ---
+async def check_single_repo(bot: Bot, repo_name: str) -> bool:
+    """Проверяет один репозиторий на наличие новых релизов
+    
+    Returns:
+        bool: True если найден новый релиз, False иначе
+    """
+    logger.info(f"🔍 Проверка репозитория: {repo_name}")
+    
     try:
+        # Обновляем статистику проверок
+        statistics_manager.increment_checks(repo_name)
+        
         async with ClientSession() as session:
-            release = await fetch_release(session, repo_name)
+            release, response_time = await fetch_release(session, repo_name)
+            
+            # Записываем информацию о проверке
+            success = release is not None
+            priority_manager.record_check(repo_name, success, response_time)
 
             if not release:
-                logger.warning(f"Не получены данные о релизах для {repo_name}")
-                return
+                logger.warning(f"❌ Не получены данные о релизах для {repo_name}")
+                return False
 
             current_tag = release.get('tag_name')
             if not current_tag:
-                logger.warning(f"Не найден тег в данных релиза для {repo_name}")
-                return
+                logger.warning(f"❌ Не найден тег в данных релиза для {repo_name}")
+                return False
 
             last_tag = state_manager.get_last_tag(repo_name)
-            logger.info(f"Текущий тег: {current_tag}, предыдущий: {last_tag}")
-
+            
             if last_tag != current_tag:
-                logger.info(f"Найден новый релиз: {current_tag}")
+                logger.info(f"🆕 Найден новый релиз {repo_name}: {current_tag} (предыдущий: {last_tag})")
 
+                # Добавляем в историю
                 history_manager.add_release(repo_name, release)
+                
+                # Обновляем приоритет
                 priority_manager.record_update(repo_name)
-                await send_notifications(bot, repo_name, release)
+                
+                # Отправляем уведомления
+                notifications_sent = await send_notifications(bot, repo_name, release)
+                
+                # Обновляем состояние
                 state_manager.update_tag(repo_name, current_tag)
 
-                logger.info(f"Успешно обработан новый релиз для {repo_name}")
+                logger.info(f"✅ Успешно обработан новый релиз для {repo_name}. "
+                           f"Отправлено уведомлений: {notifications_sent}")
+                return True
             else:
-                logger.info(f"Обновлений для {repo_name} не найдено")
+                logger.debug(f"ℹ️ Обновлений для {repo_name} не найдено")
+                return False
 
     except Exception as e:
-        logger.error(f"Ошибка при проверке репозитория {repo_name}: {str(e)}")
+        logger.error(f"❌ Критическая ошибка при проверке репозитория {repo_name}: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        
+        # Увеличиваем счетчик ошибок
+        statistics_manager.increment_errors()
+        
+        # Уведомляем админа о критических ошибках
         if ADMIN_ID:
             try:
-                await bot.send_message(
-                    ADMIN_ID,
-                    f"⚠️ Ошибка при проверке репозитория {repo_name}: {str(e)}"
+                error_message = (
+                    f"⚠️ *Критическая ошибка при проверке репозитория*\n\n"
+                    f"📦 Репозиторий: `{repo_name}`\n"
+                    f"❌ Ошибка: `{str(e)[:500]}`\n"
+                    f"🕒 Время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
                 )
+                await bot.send_message(ADMIN_ID, error_message, parse_mode="Markdown")
             except:
-                pass
+                pass  # Игнорируем ошибки отправки уведомлений админу
+        
+        return False
 
-
-# --- ПРОВЕРКА РЕПОЗИТОРИЕВ С УЧЕТОМ ПРИОРИТЕТОВ ---
+# --- УЛУЧШЕННАЯ ПРОВЕРКА РЕПОЗИТОРИЕВ С УЧЕТОМ ПРИОРИТЕТОВ ---
 async def check_repositories(bot: Bot):
-    logger.info("Запуск проверки репозиториев с учетом приоритетов...")
+    """Проверяет репозитории согласно их приоритетам"""
+    logger.info("🔄 Запуск автоматической проверки репозиториев с учетом приоритетов...")
 
+    # Обновляем приоритеты если нужно
     if priority_manager.should_update_priorities():
+        logger.info("📊 Обновление приоритетов репозиториев...")
         priority_manager.update_priorities(history_manager)
 
     current_time = datetime.now(timezone.utc)
+    repos_to_check = []
+    repos_checked = 0
+    repos_with_updates = 0
 
+    # Определяем какие репозитории нужно проверить
     for repo_name in REPOS:
         priority_data = priority_manager.get_priority(repo_name)
         check_interval = priority_data['check_interval']
+        last_check = priority_data.get('last_check')
 
-        if priority_data.get('last_check'):
-            last_check = datetime.fromisoformat(priority_data['last_check'])
-            if current_time - last_check >= timedelta(minutes=check_interval):
-                await check_single_repo(bot, repo_name)
-                priority_data['last_check'] = current_time.isoformat()
-                priority_manager._save_priorities()
+        should_check = False
+        if not last_check:
+            should_check = True
+            logger.debug(f"📦 {repo_name}: первая проверка")
         else:
-            await check_single_repo(bot, repo_name)
+            try:
+                last_check_time = datetime.fromisoformat(last_check)
+                time_since_check = current_time - last_check_time
+                
+                if time_since_check >= timedelta(minutes=check_interval):
+                    should_check = True
+                    logger.debug(f"📦 {repo_name}: прошло {time_since_check}, интервал {check_interval} мин")
+                else:
+                    remaining = timedelta(minutes=check_interval) - time_since_check
+                    logger.debug(f"📦 {repo_name}: ещё {remaining} до следующей проверки")
+            except Exception as e:
+                logger.error(f"Ошибка парсинга времени последней проверки для {repo_name}: {e}")
+                should_check = True
+
+        if should_check:
+            repos_to_check.append(repo_name)
+
+    logger.info(f"📋 Будет проверено {len(repos_to_check)} из {len(REPOS)} репозиториев")
+
+    # Проверяем репозитории
+    for repo_name in repos_to_check:
+        try:
+            has_update = await check_single_repo(bot, repo_name)
+            repos_checked += 1
+            
+            if has_update:
+                repos_with_updates += 1
+
+            # Обновляем время последней проверки
+            priority_data = priority_manager.get_priority(repo_name)
             priority_data['last_check'] = current_time.isoformat()
             priority_manager._save_priorities()
 
+            # Небольшая пауза между проверками
+            await asyncio.sleep(1)
+
+        except Exception as e:
+            logger.error(f"Ошибка при проверке {repo_name}: {e}")
+            continue
+
+    logger.info(f"✅ Проверка завершена: проверено {repos_checked}, "
+                f"найдено обновлений {repos_with_updates}")
 
 # --- ПРИНУДИТЕЛЬНАЯ ПРОВЕРКА ВСЕХ РЕПОЗИТОРИЕВ ---
 async def check_all_repositories(bot: Bot):
-    logger.info("Запуск принудительной проверки всех репозиториев...")
+    """Принудительно проверяет все репозитории"""
+    logger.info("🔄 Запуск принудительной проверки всех репозиториев...")
+
+    repos_checked = 0
+    repos_with_updates = 0
+    current_time = datetime.now(timezone.utc)
 
     for repo_name in REPOS:
-        await check_single_repo(bot, repo_name)
-        priority_data = priority_manager.get_priority(repo_name)
-        priority_data['last_check'] = datetime.now(timezone.utc).isoformat()
-        priority_manager._save_priorities()
+        try:
+            logger.info(f"🔍 Принудительная проверка {repo_name}...")
+            has_update = await check_single_repo(bot, repo_name)
+            repos_checked += 1
+            
+            if has_update:
+                repos_with_updates += 1
 
+            # Обновляем время последней проверки
+            priority_data = priority_manager.get_priority(repo_name)
+            priority_data['last_check'] = current_time.isoformat()
+            priority_manager._save_priorities()
 
-# --- КОМАНДА /start ---
+            # Пауза между проверками
+            await asyncio.sleep(2)
+
+        except Exception as e:
+            logger.error(f"Ошибка при принудительной проверке {repo_name}: {e}")
+            continue
+
+    logger.info(f"✅ Принудительная проверка завершена: проверено {repos_checked}, "
+                f"найдено обновлений {repos_with_updates}")
+
+# --- ОБРАБОТЧИКИ КОМАНД ---
+
 async def start_command(message: Message):
-    user_manager.add_user(message.from_user.id)
-    logger.info(f"Получена команда /start от пользователя {message.from_user.id}")
+    """Обработчик команды /start"""
+    username = message.from_user.username
+    user_manager.add_user(message.from_user.id, username)
+    user_manager.record_activity(message.from_user.id, 'command')
+    
+    logger.info(f"👤 Команда /start от пользователя {message.from_user.id} (@{username})")
 
-    # Если пользователь - админ, показываем дополнительные команды
+    # Создаем приветственное сообщение в зависимости от роли пользователя
     if message.from_user.id == ADMIN_ID:
-        await message.answer(
-            "👋 *Привет, Администратор!*\n\n"
+        welcome_message = (
+            "👋 *Добро пожаловать, Администратор!*\n\n"
+            "🤖 Это бот для мониторинга релизов GitHub репозиториев с майнерами.\n\n"
             "📌 *Основные команды:*\n"
-            "/filter - установить фильтры для уведомлений\n"
-            "/myfilters - посмотреть текущие фильтры\n"
-            "/clearfilters - очистить все фильтры\n"
-            "/last - релизы за последние 3 дня\n"
-            "/donate - поддержать разработчика\n"
-            "/help - справка по использованию\n\n"
+            "• /filter — настроить фильтры уведомлений\n"
+            "• /myfilters — показать текущие фильтры\n"
+            "• /clearfilters — очистить все фильтры\n"
+            "• /last — релизы за последние 3 дня\n"
+            "• /help — подробная справка\n"
+            "• /donate — поддержать разработчика\n\n"
             "🔧 *Административные команды:*\n"
-            "/priority - показать приоритеты репозиториев\n"
-            "/pstats - статистика приоритетов\n"
-            "/checkall - принудительно проверить все репозитории\n"
-            "/stats - общая статистика бота"
+            "• /priority — приоритеты репозиториев\n"
+            "• /pstats — статистика приоритетов\n"
+            "• /checkall — проверить все репозитории\n"
+            "• /stats — общая статистика бота\n"
+            "• /backup — создать резервные копии\n\n"
+            "ℹ️ *Как это работает:*\n"
+            "Бот автоматически проверяет репозитории и уведомляет о новых релизах. "
+            "Частота проверки зависит от активности репозитория."
         )
     else:
-        await message.answer(
-            "👋 Привет! Я бот для отслеживания релизов на GitHub.\n\n"
-            "📌 *Основные команды:*\n"
-            "/filter - установить фильтры для уведомлений\n"
-            "/myfilters - посмотреть текущие фильтры\n"
-            "/clearfilters - очистить все фильтры\n"
-            "/last - релизы за последние 3 дня\n"
-            "/donate - поддержать разработчика\n"
-            "/help - справка по использованию"
+        welcome_message = (
+            "👋 *Добро пожаловать!*\n\n"
+            "🤖 Это бот для мониторинга релизов GitHub репозиториев с майнерами.\n\n"
+            "📌 *Доступные команды:*\n"
+            "• /filter — настроить фильтры уведомлений\n"
+            "• /myfilters — показать текущие фильтры\n"
+            "• /clearfilters — очистить все фильтры\n"
+            "• /last — релизы за последние 3 дня\n"
+            "• /help — подробная справка\n"
+            "• /donate — поддержать разработчика\n\n"
+            "ℹ️ *Принцип работы:*\n"
+            "По умолчанию вы получаете ВСЕ релизы. "
+            "Используйте фильтры, чтобы получать только интересующие вас обновления."
         )
 
+    await message.answer(welcome_message, parse_mode="Markdown")
+
+    # Показываем последние релизы
     recent_releases = history_manager.get_recent_releases(3)
     if recent_releases:
-        await message.answer("📅 *Последние релизы за 3 дня:*\n")
-        for rel in recent_releases:
-            msg = format_release_message(rel['repo_name'], rel)
-            await message.answer(msg, parse_mode="Markdown")
+        await message.answer("📅 *Последние релизы за 3 дня:*", parse_mode="Markdown")
+        
+        # Ограничиваем количество показываемых релизов
+        for rel in recent_releases[:5]:  # Максимум 5 релизов
+            try:
+                msg = format_release_message(rel['repo_name'], rel)
+                await message.answer(msg, parse_mode="Markdown")
+                await asyncio.sleep(0.5)  # Небольшая пауза между сообщениями
+            except Exception as e:
+                logger.error(f"Ошибка отправки релиза в /start: {e}")
+                continue
     else:
-        await message.answer("📭 За последние 3 дня релизов не было.")
+        await message.answer("📭 За последние 3 дня новых релизов не было.")
 
+async def filter_command(message: Message):
+    """Обработчик команды /filter"""
+    user_manager.add_user(message.from_user.id, message.from_user.username)
+    user_manager.record_activity(message.from_user.id, 'command')
+    
+    logger.info(f"🔍 Пользователь {message.from_user.id} настраивает фильтры")
 
-# --- КОМАНДА /priority ---
-async def priority_command(message: Message):
-    user_manager.add_user(message.from_user.id)
+    # Создаем клавиатуру с кнопкой отмены
+    keyboard = InlineKeyboardBuilder()
+    keyboard.button(text="❌ Отмена", callback_data="cancel_filter")
 
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("⛔ У вас нет прав для выполнения этой команды.")
-        return
+    current_filters = filter_manager.get_filters(str(message.from_user.id))
+    current_filters_text = ""
+    
+    if current_filters:
+        current_filters_text = f"\n\n🎯 *Текущие фильтры:* {', '.join(current_filters)}"
 
-    priority_info = "📊 *Приоритеты репозиториев:*\n\n"
-
-    for repo in REPOS:
-        priority_data = priority_manager.get_priority(repo)
-        interval = priority_data['check_interval']
-        score = priority_data['priority_score']
-
-        if score >= PRIORITY_THRESHOLD_HIGH:
-            status = "🔴 Высокий"
-        elif score <= PRIORITY_THRESHOLD_LOW:
-            status = "🟢 Низкий"
-        else:
-            status = "🟡 Средний"
-
-        priority_info += f"{repo}: {status} (интервал: {interval} мин, приоритет: {score:.2f})\n"
-
-    await message.answer(priority_info, parse_mode="Markdown")
-
-
-# --- КОМАНДА /pstats ---
-async def pstats_command(message: Message):
-    user_manager.add_user(message.from_user.id)
-
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("⛔ У вас нет прав для выполнения этой команды.")
-        return
-
-    stats = priority_manager.get_priority_stats()
-
-    stats_message = (
-        f"📊 *Статистика приоритетов репозиториев:*\n\n"
-        f"🔴 Высокий приоритет: {stats['high_priority']}\n"
-        f"🟡 Средний приоритет: {stats['medium_priority']}\n"
-        f"🟢 Низкий приоритет: {stats['low_priority']}\n"
-        f"📦 Всего репозиториев: {stats['total_repos']}\n\n"
-        f"🔄 Последнее обновление: {priority_manager.last_priority_update.strftime('%Y-%m-%d %H:%M') if priority_manager.last_priority_update else 'Еще не обновлялось'}"
+    await message.answer(
+        f"🔍 *Настройка фильтров уведомлений*\n\n"
+        f"Введите ключевые слова через пробел для фильтрации релизов.\n\n"
+        f"*Примеры:*\n"
+        f"• `qubitcoin qtc` — только релизы с Qubitcoin\n"
+        f"• `nvidia cuda` — релизы для NVIDIA\n"
+        f"• `amd opencl` — релизы для AMD\n\n"
+        f"🔎 *Поиск производится в:*\n"
+        f"• Названии релиза\n"
+        f"• Теге версии\n"
+        f"• Описании релиза\n"
+        f"• Именах файлов{current_filters_text}\n\n"
+        f"⏳ Ожидаю ввод ключевых слов...",
+        reply_markup=keyboard.as_markup(),
+        parse_mode="Markdown"
     )
 
-    await message.answer(stats_message, parse_mode="Markdown")
+async def cancel_filter_callback(callback: CallbackQuery):
+    """Обработчик отмены настройки фильтров"""
+    user_manager.add_user(callback.from_user.id, callback.from_user.username)
+    
+    logger.info(f"❌ Пользователь {callback.from_user.id} отменил настройку фильтров")
 
+    await callback.message.edit_text(
+        "❌ *Настройка фильтров отменена*\n\n"
+        "Используйте /filter для повторной настройки фильтров.",
+        reply_markup=None,
+        parse_mode="Markdown"
+    )
+    await callback.answer("Настройка фильтров отменена")
 
-# --- КОМАНДА /last ---
+async def process_filter_text(message: Message):
+    """Обработчик текста для установки фильтров"""
+    user_manager.add_user(message.from_user.id, message.from_user.username)
+    user_manager.record_activity(message.from_user.id, 'command')
+    
+    user_id = str(message.from_user.id)
+    text = message.text.strip()
+
+    logger.info(f"🔧 Пользователь {user_id} устанавливает фильтры: '{text}'")
+
+    # Проверяем, что текст не является командой
+    if text.startswith('/'):
+        return
+
+    # Разбираем ключевые слова
+    keywords = [word.strip() for word in text.split() if word.strip()]
+
+    if not keywords:
+        await message.answer(
+            "❌ *Ошибка:* Вы не ввели ключевые слова.\n\n"
+            "Пожалуйста, введите хотя бы одно ключевое слово или используйте /filter для повторной настройки.",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Ограничиваем количество ключевых слов
+    if len(keywords) > 10:
+        await message.answer(
+            "❌ *Ошибка:* Слишком много ключевых слов.\n\n"
+            "Максимальное количество: 10. Пожалуйста, сократите список.",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Сохраняем фильтры
+    filter_manager.set_filters(user_id, keywords)
+    
+    keywords_text = ", ".join(f"`{kw}`" for kw in keywords)
+    
+    await message.answer(
+        f"✅ *Фильтры успешно сохранены!*\n\n"
+        f"🎯 *Ключевые слова:* {keywords_text}\n\n"
+        f"Теперь вы будете получать уведомления только о релизах, "
+        f"содержащих эти слова.\n\n"
+        f"💡 *Совет:* Используйте /myfilters для просмотра текущих фильтров "
+        f"или /clearfilters для их удаления.",
+        parse_mode="Markdown"
+    )
+
+async def myfilters_command(message: Message):
+    """Обработчик команды /myfilters"""
+    user_manager.add_user(message.from_user.id, message.from_user.username)
+    user_manager.record_activity(message.from_user.id, 'command')
+    
+    user_id = str(message.from_user.id)
+    filters = filter_manager.get_filters(user_id)
+
+    logger.info(f"📋 Пользователь {user_id} запрашивает свои фильтры")
+
+    if not filters:
+        await message.answer(
+            "📭 *У вас нет установленных фильтров*\n\n"
+            "Это означает, что вы получаете уведомления о ВСЕХ новых релизах.\n\n"
+            "💡 Используйте /filter для настройки фильтров, если хотите получать "
+            "только определенные релизы.",
+            parse_mode="Markdown"
+        )
+    else:
+        keywords_text = ", ".join(f"`{kw}`" for kw in filters)
+        
+        await message.answer(
+            f"📋 *Ваши текущие фильтры:*\n\n"
+            f"🎯 *Ключевые слова:* {keywords_text}\n\n"
+            f"ℹ️ Вы получаете уведомления только о релизах, содержащих эти слова.\n\n"
+            f"💡 *Управление фильтрами:*\n"
+            f"• /filter — изменить фильтры\n"
+            f"• /clearfilters — удалить все фильтры",
+            parse_mode="Markdown"
+        )
+
+async def clearfilters_command(message: Message):
+    """Обработчик команды /clearfilters"""
+    user_manager.add_user(message.from_user.id, message.from_user.username)
+    user_manager.record_activity(message.from_user.id, 'command')
+    
+    user_id = str(message.from_user.id)
+
+    logger.info(f"🗑️ Пользователь {user_id} очищает фильтры")
+
+    current_filters = filter_manager.get_filters(user_id)
+    
+    if current_filters:
+        filter_manager.clear_filters(user_id)
+        keywords_text = ", ".join(f"`{kw}`" for kw in current_filters)
+        
+        await message.answer(
+            f"🗑️ *Фильтры успешно удалены*\n\n"
+            f"❌ *Удаленные фильтры:* {keywords_text}\n\n"
+            f"ℹ️ Теперь вы будете получать уведомления о ВСЕХ новых релизах.\n\n"
+            f"💡 Используйте /filter для повторной настройки фильтров.",
+            parse_mode="Markdown"
+        )
+    else:
+        await message.answer(
+            "📭 *У вас и так нет установленных фильтров*\n\n"
+            "Вы уже получаете уведомления о всех релизах.\n\n"
+            "💡 Используйте /filter для настройки фильтров.",
+            parse_mode="Markdown"
+        )
+
 async def last_command(message: Message):
-    user_manager.add_user(message.from_user.id)
-    logger.info(f"Пользователь {message.from_user.id} запрашивает релизы за последние 3 дня")
+    """Обработчик команды /last"""
+    user_manager.add_user(message.from_user.id, message.from_user.username)
+    user_manager.record_activity(message.from_user.id, 'command')
+    
+    logger.info(f"📅 Пользователь {message.from_user.id} запрашивает последние релизы")
 
     recent_releases = history_manager.get_recent_releases(3)
 
     if not recent_releases:
-        await message.answer("📭 За последние 3 дня релизов не было.")
-    else:
-        await message.answer("📅 *Релизы за последние 3 дня:*\n")
-        for rel in recent_releases:
-            msg = format_release_message(rel['repo_name'], rel)
-            await message.answer(msg, parse_mode="Markdown")
-
-
-# --- КОМАНДА /checkall ---
-async def checkall_command(message: Message):
-    user_manager.add_user(message.from_user.id)
-
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("⛔ У вас нет прав для выполнения этой команды.")
-        return
-
-    await message.answer("🔄 Запускаю проверку всех репозиториев...")
-    try:
-        await check_all_repositories(message.bot)
-        await message.answer("✅ Проверка всех репозиториев завершена")
-    except Exception as e:
-        logger.error(f"Ошибка при проверке всех репозиториев: {e}")
-        await message.answer(f"⚠️ Ошибка при проверке: {str(e)}")
-
-
-# --- КОМАНДА /filter ---
-async def filter_command(message: Message):
-    user_manager.add_user(message.from_user.id)
-    logger.info(f"Пользователь {message.from_user.id} хочет установить фильтры")
-
-    keyboard = InlineKeyboardBuilder()
-    keyboard.button(text="❌ Отмена", callback_data="cancel_filter")
-
-    await message.answer(
-        "🔍 *Настройка фильтров*\n\n"
-        "Введите ключевые слова через пробел, по которым будет производиться фильтрация релизов.\n"
-        "Например: `qubitcoin qtc`\n\n"
-        "Бот будет искать совпадения в названиях релизов и описаниях.",
-        reply_markup=keyboard.as_markup()
-    )
-    await message.answer("⏳ Ожидаю ввод ключевых слов...")
-
-
-# --- ОБРАБОТКА КНОПКИ ОТМЕНЫ ---
-async def cancel_filter_callback(callback: CallbackQuery):
-    user_manager.add_user(callback.from_user.id)
-    user_id = str(callback.from_user.id)
-    logger.info(f"Пользователь {user_id} отменил установку фильтров")
-
-    await callback.message.edit_text(
-        "❌ *Настройка фильтров отменена*",
-        reply_markup=None
-    )
-    await callback.answer()
-
-
-# --- ОБРАБОТКА ТЕКСТА ПОСЛЕ /filter ---
-async def process_filter_text(message: Message):
-    user_manager.add_user(message.from_user.id)
-    user_id = str(message.from_user.id)
-    keywords = message.text.strip().split()
-
-    logger.info(f"Пользователь {user_id} вводит фильтры: {keywords}")
-
-    if not keywords:
-        await message.answer("❌ Вы не ввели ключевые слова. Попробуйте снова.")
-        return
-
-    filter_manager.set_filters(user_id, keywords)
-    await message.answer(
-        f"✅ *Фильтры сохранены!*\n\n"
-        f"Ключевые слова: {', '.join(keywords)}\n\n"
-        "Теперь вы будете получать уведомления только о релизах, содержащих эти слова."
-    )
-
-
-# --- КОМАНДА /myfilters ---
-async def myfilters_command(message: Message):
-    user_manager.add_user(message.from_user.id)
-    user_id = str(message.from_user.id)
-    filters = filter_manager.get_filters(user_id)
-
-    logger.info(f"Пользователь {user_id} запрашивает свои фильтры: {filters}")
-
-    if not filters:
-        await message.answer("📭 У вас нет установленных фильтров.")
+        await message.answer(
+            "📭 *За последние 3 дня релизов не было*\n\n"
+            "Бот продолжает мониторинг репозиториев. "
+            "Как только появятся новые релизы, вы получите уведомление!",
+            parse_mode="Markdown"
+        )
     else:
         await message.answer(
-            f"📋 *Ваши текущие фильтры:*\n\n"
-            f"Ключевые слова: {', '.join(filters)}"
+            f"📅 *Найдено {len(recent_releases)} релизов за последние 3 дня:*",
+            parse_mode="Markdown"
+        )
+        
+        # Ограничиваем количество показываемых релизов
+        for i, rel in enumerate(recent_releases[:10], 1):  # Максимум 10 релизов
+            try:
+                msg = format_release_message(rel['repo_name'], rel)
+                await message.answer(msg, parse_mode="Markdown")
+                
+                # Добавляем паузу после каждых 3 сообщений
+                if i % 3 == 0 and i < len(recent_releases):
+                    await asyncio.sleep(1)
+                    
+            except Exception as e:
+                logger.error(f"Ошибка отправки релиза в /last: {e}")
+                continue
+
+async def help_command(message: Message):
+    """Обработчик команды /help"""
+    user_manager.add_user(message.from_user.id, message.from_user.username)
+    user_manager.record_activity(message.from_user.id, 'command')
+    
+    logger.info(f"❓ Пользователь {message.from_user.id} запрашивает справку")
+
+    # Создаем разную справку для админа и обычных пользователей
+    if message.from_user.id == ADMIN_ID:
+        help_text = (
+            "📚 *Справка по использованию бота (Администратор)*\n\n"
+            
+            "🔍 *Система фильтрации:*\n"
+            "• Без фильтров — получаете ВСЕ релизы\n"
+            "• С фильтрами — только релизы с указанными словами\n"
+            "• Поиск в названии, теге, описании и именах файлов\n\n"
+            
+            "📋 *Пользовательские команды:*\n"
+            "• /start — приветствие и последние релизы\n"
+            "• /filter — настроить фильтры уведомлений\n"
+            "• /myfilters — показать текущие фильтры\n"
+            "• /clearfilters — удалить все фильтры\n"
+            "• /last — релизы за последние 3 дня\n"
+            "• /donate — поддержать разработчика\n\n"
+            
+            "🔧 *Административные команды:*\n"
+            "• /stats — общая статистика бота\n"
+            "• /priority — приоритеты репозиториев\n"
+            "• /pstats — статистика приоритетов\n"
+            "• /checkall — проверить все репозитории\n"
+            "• /backup — создать резервные копии\n\n"
+            
+            "⚙️ *Как работает система приоритетов:*\n"
+            "• Бот автоматически адаптирует частоту проверок\n"
+            "• Активные репозитории проверяются чаще\n"
+            "• Неактивные — реже (экономия ресурсов)\n\n"
+            
+            "💡 *Советы по использованию:*\n"
+            "• Используйте конкретные фильтры (например: 'qubitcoin')\n"
+            "• Регулярно проверяйте /pstats для мониторинга\n"
+            "• При проблемах используйте /checkall"
+        )
+    else:
+        help_text = (
+            "📚 *Справка по использованию бота*\n\n"
+            
+            "🤖 *О боте:*\n"
+            "Бот отслеживает новые релизы популярных майнеров "
+            "и автоматически уведомляет о них.\n\n"
+            
+            "🔍 *Система фильтрации:*\n"
+            "• *Без фильтров* — получаете ВСЕ релизы\n"
+            "• *С фильтрами* — только релизы с указанными словами\n"
+            "• Поиск производится в названии, описании, тегах и именах файлов\n\n"
+            
+            "📋 *Доступные команды:*\n"
+            "• /start — приветствие и последние релизы\n"
+            "• /filter — настроить фильтры уведомлений\n"
+            "• /myfilters — показать текущие фильтры\n"
+            "• /clearfilters — удалить все фильтры\n"
+            "• /last — релизы за последние 3 дня\n"
+            "• /help — эта справка\n"
+            "• /donate — поддержать разработчика\n\n"
+            
+            "💡 *Примеры фильтров:*\n"
+            "• `qubitcoin` — только релизы Qubitcoin\n"
+            "• `nvidia cuda` — релизы для видеокарт NVIDIA\n"
+            "• `amd opencl` — релизы для видеокарт AMD\n"
+            "• `cpu miner` — CPU майнеры\n\n"
+            
+            "❓ *Часто задаваемые вопросы:*\n"
+            "• *Q:* Как получать все релизы?\n"
+            "  *A:* Не устанавливайте фильтры или используйте /clearfilters\n\n"
+            "• *Q:* Не приходят уведомления?\n"
+            "  *A:* Проверьте фильтры через /myfilters\n\n"
+            "• *Q:* Как часто бот проверяет релизы?\n"
+            "  *A:* Автоматически, в зависимости от активности репозитория"
         )
 
+    await message.answer(help_text, parse_mode="Markdown")
 
-# --- КОМАНДА /clearfilters ---
-async def clearfilters_command(message: Message):
-    user_manager.add_user(message.from_user.id)
-    user_id = str(message.from_user.id)
-
-    logger.info(f"Пользователь {user_id} очищает фильтры")
-
-    if filter_manager.get_filters(user_id):
-        filter_manager.clear_filters(user_id)
-        await message.answer("🗑️ Ваши фильтры успешно удалены.")
-    else:
-        await message.answer("📭 У вас и так не было установленных фильтров.")
-
-
-# --- КОМАНДА /stats ---
-async def stats_command(message: Message):
-    user_manager.add_user(message.from_user.id)
-
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("⛔ У вас нет прав для выполнения этой команды.")
-        return
-
-    stats_message = (
-        f"📊 *Статистика бота:*\n\n"
-        f"👥 Всего пользователей: {user_manager.get_count()}\n"
-        f"🔍 Пользователей с фильтрами: {filter_manager.get_users_with_filters_count()}\n"
-        f"📦 Репозиториев отслеживается: {len(REPOS)}\n"
-        f"📈 Релизов в истории: {history_manager.get_count()}"
-    )
-
-    await message.answer(stats_message, parse_mode="Markdown")
-
-
-# --- КОМАНДА /donate ---
 async def donate_command(message: Message):
-    user_manager.add_user(message.from_user.id)
-    logger.info(f"Пользователь {message.from_user.id} запросил информацию о донате")
+    """Обработчик команды /donate"""
+    user_manager.add_user(message.from_user.id, message.from_user.username)
+    user_manager.record_activity(message.from_user.id, 'command')
+    
+    logger.info(f"💝 Пользователь {message.from_user.id} запросил информацию о донате")
 
     keyboard = InlineKeyboardBuilder()
     keyboard.button(text="💝 Поддержать разработчика", url=DONATE_URL)
 
     await message.answer(
-        "💖 *Спасибо за интерес к поддержке моего проекта!*\n\n"
-        "Если вам нравится мой бот и вы хотите помочь в его развитии, "
-        "вы можете поддержать меня финансово. Любая сумма будет принята с благодарностью! 🙏\n\n"
-        "Ваши пожертвования помогут:\n"
-        "• Оплачивать сервер для работы бота 24/7\n"
-        "• Разрабатывать новые функции\n"
-        "• Улучшать существующий функционал\n\n"
-        "Нажмите на кнопку ниже, чтобы перейти на страницу доната:",
+        "💖 *Поддержка проекта*\n\n"
+        "Спасибо за интерес к поддержке моего бота! "
+        "Ваша помощь очень важна для развития проекта.\n\n"
+        
+        "💡 *На что идут средства:*\n"
+        "• Оплата сервера для работы бота 24/7\n"
+        "• Развитие и улучшение функционала\n"
+        "• Добавление новых репозиториев\n"
+        "• Техническое обслуживание и поддержка\n\n"
+        
+        "🎯 *Планы развития:*\n"
+        "• Веб-интерфейс для управления\n"
+        "• Поддержка других платформ (GitLab, etc.)\n"
+        "• Расширенная система фильтрации\n"
+        "• Уведомления о статистике майнинга\n\n"
+        
+        "🙏 Любая сумма будет принята с благодарностью!\n\n"
+        "Нажмите кнопку ниже для перехода на страницу доната:",
         reply_markup=keyboard.as_markup(),
         parse_mode="Markdown"
     )
 
+# --- АДМИНИСТРАТИВНЫЕ КОМАНДЫ ---
 
-# --- КОМАНДА /help ---
-async def help_command(message: Message):
-    user_manager.add_user(message.from_user.id)
-    logger.info(f"Пользователь {message.from_user.id} запрашивает помощь")
+async def stats_command(message: Message):
+    """Обработчик команды /stats"""
+    user_manager.add_user(message.from_user.id, message.from_user.username)
+    user_manager.record_activity(message.from_user.id, 'command')
 
-    # Если пользователь - админ, показываем дополнительные команды
-    if message.from_user.id == ADMIN_ID:
-        await message.answer(
-            "📚 *Справка по использованию бота*\n\n"
-            "🔍 *Фильтрация релизов:*\n"
-            "1. Используйте команду /filter\n"
-            "2. Введите ключевые слова через пробел\n"
-            "3. Бот будет присылать только релизы, содержащие эти слова\n\n"
-            "📋 *Команды управления фильтрами:*\n"
-            "/filter - установить фильтры\n"
-            "/myfilters - показать текущие фильтры\n"
-            "/clearfilters - удалить все фильтры\n\n"
-            "📅 *Просмотр релизов:*\n"
-            "/last - показать релизы за последние 3 дня\n"
-            "/start - показать последние релизы за 3 дня\n\n"
-            "💝 *Поддержка проекта:*\n"
-            "/donate - поддержать разработчика\n\n"
-            "🔧 *Административные команды:*\n"
-            "/priority - показать приоритеты репозиториев\n"
-            "/pstats - статистика приоритетов\n"
-            "/checkall - принудительно проверить все репозитории\n"
-            "/stats - общая статистика бота\n\n"
-            "📌 *Как работает фильтрация:*\n"
-            "Бот ищет ключевые слова в:\n"
-            "• Названии релиза\n"
-            "• Теге версии\n"
-            "• Описании релиза\n\n"
-            "Пример: если вы введете 'qubitcoin qtc', бот будет присылать только релизы, где встречаются эти слова."
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ У вас нет прав для выполнения этой команды.")
+        return
+
+    logger.info(f"📊 Администратор запрашивает статистику")
+
+    # Собираем статистику
+    user_stats = user_manager.get_stats()
+    filter_stats = filter_manager.get_stats()
+    history_stats = history_manager.get_stats()
+    priority_stats = priority_manager.get_priority_stats()
+    
+    uptime = statistics_manager.get_uptime()
+    
+    stats_message = (
+        f"📊 *Статистика бота*\n\n"
+        
+        f"👥 *Пользователи:*\n"
+        f"• Всего: {user_stats['total_users']}\n"
+        f"• Активных (30 дней): {user_stats['active_users_30d']}\n"
+        f"• Использовано команд: {user_stats['total_commands']}\n"
+        f"• Получено уведомлений: {user_stats['total_notifications']}\n\n"
+        
+        f"🔍 *Фильтры:*\n"
+        f"• Пользователей с фильтрами: {filter_stats['users_with_filters']}\n"
+        f"• Среднее слов на пользователя: {filter_stats['average_keywords_per_user']}\n\n"
+        
+        f"📦 *Репозитории:*\n"
+        f"• Всего отслеживается: {priority_stats['total_repos']}\n"
+        f"• Высокий приоритет: {priority_stats['high_priority']} 🔴\n"
+        f"• Средний приоритет: {priority_stats['medium_priority']} 🟡\n"
+        f"• Низкий приоритет: {priority_stats['low_priority']} 🟢\n"
+        f"• Проблемные: {priority_stats['failing_repos']} ⚠️\n"
+        f"• Средний интервал: {priority_stats['average_interval']} мин\n\n"
+        
+        f"📈 *Активность:*\n"
+        f"• Всего проверок: {statistics_manager.stats['total_checks']}\n"
+        f"• Найдено релизов: {statistics_manager.stats['total_releases_found']}\n"
+        f"• Отправлено уведомлений: {statistics_manager.stats['total_notifications_sent']}\n"
+        f"• Ошибок: {statistics_manager.stats['errors_count']}\n\n"
+        
+        f"📅 *История:*\n"
+        f"• Релизов в базе: {history_stats['total_releases']}\n"
+        f"• За последние 7 дней: {history_stats['releases_last_7_days']}\n\n"
+        
+        f"⏱️ *Время работы:* {uptime}\n"
+        f"🔄 *Последняя активность:* {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+
+    await message.answer(stats_message, parse_mode="Markdown")
+
+async def priority_command(message: Message):
+    """Обработчик команды /priority"""
+    user_manager.add_user(message.from_user.id, message.from_user.username)
+    user_manager.record_activity(message.from_user.id, 'command')
+
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ У вас нет прав для выполнения этой команды.")
+        return
+
+    logger.info(f"📊 Администратор запрашивает приоритеты репозиториев")
+
+    priority_info = "📊 *Приоритеты репозиториев:*\n\n"
+
+    # Сортируем репозитории по приоритету (сначала высокий)
+    sorted_repos = sorted(
+        REPOS, 
+        key=lambda repo: priority_manager.get_priority(repo)['priority_score'],
+        reverse=True
+    )
+
+    for repo in sorted_repos:
+        priority_data = priority_manager.get_priority(repo)
+        interval = priority_data['check_interval']
+        score = priority_data['priority_score']
+        failures = priority_data.get('consecutive_failures', 0)
+        total_checks = priority_data.get('total_checks', 0)
+        updates = priority_data.get('update_count', 0)
+
+        # Определяем статус
+        if score >= PRIORITY_THRESHOLD_HIGH:
+            status = "🔴"
+            status_text = "Высокий"
+        elif score <= PRIORITY_THRESHOLD_LOW:
+            status = "🟢"
+            status_text = "Низкий"
+        else:
+            status = "🟡"
+            status_text = "Средний"
+
+        # Добавляем индикатор проблем
+        problem_indicator = ""
+        if failures > 3:
+            problem_indicator = f" ⚠️{failures}"
+
+        repo_short = repo.split('/')[-1]  # Показываем только название репозитория
+        
+        priority_info += (
+            f"{status} *{repo_short}*\n"
+            f"   └ {status_text} приоритет ({score:.2f})\n"
+            f"   └ Интервал: {interval} мин{problem_indicator}\n"
+            f"   └ Обновлений: {updates}, проверок: {total_checks}\n\n"
         )
+
+    # Добавляем легенду
+    priority_info += (
+        f"📝 *Легенда:*\n"
+        f"🔴 Высокий приоритет (≥{PRIORITY_THRESHOLD_HIGH}) — проверка каждые {MIN_CHECK_INTERVAL_MINUTES} мин\n"
+        f"🟡 Средний приоритет — проверка по расписанию\n"
+        f"🟢 Низкий приоритет (≤{PRIORITY_THRESHOLD_LOW}) — проверка каждые {MAX_CHECK_INTERVAL_MINUTES//60} ч\n"
+        f"⚠️ Проблемы с подключением"
+    )
+
+    await message.answer(priority_info, parse_mode="Markdown")
+
+async def pstats_command(message: Message):
+    """Обработчик команды /pstats"""
+    user_manager.add_user(message.from_user.id, message.from_user.username)
+    user_manager.record_activity(message.from_user.id, 'command')
+
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ У вас нет прав для выполнения этой команды.")
+        return
+
+    logger.info(f"📈 Администратор запрашивает статистику приоритетов")
+
+    stats = priority_manager.get_priority_stats()
+    
+    # Определяем эффективность системы
+    if stats['total_repos'] > 0:
+        high_ratio = stats['high_priority'] / stats['total_repos'] * 100
+        low_ratio = stats['low_priority'] / stats['total_repos'] * 100
+        medium_ratio = stats['medium_priority'] / stats['total_repos'] * 100
     else:
-        await message.answer(
-            "📚 *Справка по использованию бота*\n\n"
-            "🔍 *Фильтрация релизов:*\n"
-            "1. Используйте команду /filter\n"
-            "2. Введите ключевые слова через пробел\n"
-            "3. Бот будет присылать только релизы, содержащие эти слова\n\n"
-            "📋 *Команды управления фильтрами:*\n"
-            "/filter - установить фильтры\n"
-            "/myfilters - показать текущие фильтры\n"
-            "/clearfilters - удалить все фильтры\n\n"
-            "📅 *Просмотр релизов:*\n"
-            "/last - показать релизы за последние 3 дня\n"
-            "/start - показать последние релизы за 3 дня\n\n"
-            "💝 *Поддержка проекта:*\n"
-            "/donate - поддержать разработчика\n\n"
-            "📌 *Как работает фильтрация:*\n"
-            "Бот ищет ключевые слова в:\n"
-            "• Названии релиза\n"
-            "• Теге версии\n"
-            "• Описании релиза\n\n"
-            "Пример: если вы введете 'qubitcoin qtc', бот будет присылать только релизы, где встречаются эти слова."
+        high_ratio = low_ratio = medium_ratio = 0
+
+    last_update = priority_manager.last_priority_update
+    if last_update:
+        update_text = last_update.strftime('%Y-%m-%d %H:%M UTC')
+        time_since = datetime.now(timezone.utc) - last_update
+        hours_since = time_since.total_seconds() / 3600
+    else:
+        update_text = "Еще не обновлялось"
+        hours_since = 0
+
+    stats_message = (
+        f"📈 *Статистика системы приоритетов*\n\n"
+        
+        f"📊 *Распределение приоритетов:*\n"
+        f"🔴 Высокий: {stats['high_priority']} ({high_ratio:.1f}%)\n"
+        f"🟡 Средний: {stats['medium_priority']} ({medium_ratio:.1f}%)\n"
+        f"🟢 Низкий: {stats['low_priority']} ({low_ratio:.1f}%)\n"
+        f"📦 Всего: {stats['total_repos']}\n\n"
+        
+        f"⚠️ *Проблемные репозитории:* {stats['failing_repos']}\n"
+        f"📊 *Средний интервал проверки:* {stats['average_interval']} мин\n\n"
+        
+        f"📈 *Общая активность:*\n"
+        f"• Всего проверок: {stats['total_checks']:,}\n"
+        f"• Всего обновлений: {stats['total_updates']:,}\n\n"
+        
+        f"🔄 *Последнее обновление:*\n"
+        f"• Дата: {update_text}\n"
+        f"• Прошло времени: {hours_since:.1f} ч\n\n"
+        
+        f"⚙️ *Настройки системы:*\n"
+        f"• Мин. интервал: {MIN_CHECK_INTERVAL_MINUTES} мин\n"
+        f"• Макс. интервал: {MAX_CHECK_INTERVAL_MINUTES//60} ч\n"
+        f"• Период анализа: {PRIORITY_UPDATE_DAYS} дней\n"
+        f"• Высокий приоритет: ≥{PRIORITY_THRESHOLD_HIGH}\n"
+        f"• Низкий приоритет: ≤{PRIORITY_THRESHOLD_LOW}"
+    )
+
+    await message.answer(stats_message, parse_mode="Markdown")
+
+async def checkall_command(message: Message):
+    """Обработчик команды /checkall"""
+    user_manager.add_user(message.from_user.id, message.from_user.username)
+    user_manager.record_activity(message.from_user.id, 'command')
+
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ У вас нет прав для выполнения этой команды.")
+        return
+
+    logger.info(f"🔄 Администратор запускает принудительную проверку всех репозиториев")
+
+    status_message = await message.answer(
+        "🔄 *Запуск принудительной проверки всех репозиториев...*\n\n"
+        "⏳ Это может занять несколько минут. Пожалуйста, подождите.",
+        parse_mode="Markdown"
+    )
+
+    try:
+        # Запускаем проверку
+        start_time = datetime.now()
+        await check_all_repositories(message.bot)
+        end_time = datetime.now()
+        
+        duration = (end_time - start_time).total_seconds()
+        
+        await status_message.edit_text(
+            f"✅ *Принудительная проверка завершена*\n\n"
+            f"⏱️ Время выполнения: {duration:.1f} сек\n"
+            f"📦 Проверено репозиториев: {len(REPOS)}\n"
+            f"🕒 Завершено: {end_time.strftime('%H:%M:%S')}\n\n"
+            f"Результаты проверки записаны в логи. "
+            f"Используйте /stats для просмотра общей статистики.",
+            parse_mode="Markdown"
+        )
+    
+    except Exception as e:
+        logger.error(f"Ошибка при принудительной проверке: {e}")
+        await status_message.edit_text(
+            f"❌ *Ошибка при проверке репозиториев*\n\n"
+            f"Произошла ошибка: `{str(e)[:200]}`\n\n"
+            f"Проверьте логи для получения подробной информации.",
+            parse_mode="Markdown"
         )
 
+async def backup_command(message: Message):
+    """Обработчик команды /backup для создания резервных копий"""
+    user_manager.add_user(message.from_user.id, message.from_user.username)
+    user_manager.record_activity(message.from_user.id, 'command')
+
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ У вас нет прав для выполнения этой команды.")
+        return
+
+    logger.info(f"💾 Администратор создает резервные копии")
+
+    try:
+        # Создаем папку для резервных копий с датой
+        backup_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_folder = os.path.join(BACKUP_DIR, f"backup_{backup_timestamp}")
+        os.makedirs(backup_folder, exist_ok=True)
+
+        files_to_backup = [
+            STATE_FILE,
+            FILTERS_FILE,
+            HISTORY_FILE,
+            USERS_FILE,
+            PRIORITY_FILE,
+            STATISTICS_FILE
+        ]
+
+        backed_up_files = []
+        
+        for file_path in files_to_backup:
+            if os.path.exists(file_path):
+                backup_path = os.path.join(backup_folder, os.path.basename(file_path))
+                shutil.copy2(file_path, backup_path)
+                backed_up_files.append(os.path.basename(file_path))
+
+        if backed_up_files:
+            await message.answer(
+                                f"💾 *Резервная копия создана*\n\n"
+                f"📁 Папка: `{backup_folder}`\n"
+                f"📋 Файлы: {', '.join(backed_up_files)}\n"
+                f"🕒 Время создания: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                f"✅ Всего файлов скопировано: {len(backed_up_files)}",
+                parse_mode="Markdown"
+            )
+        else:
+            await message.answer(
+                "⚠️ *Внимание*\n\n"
+                "Не найдено файлов для резервного копирования.\n"
+                "Возможно, бот запущен впервые или файлы данных отсутствуют.",
+                parse_mode="Markdown"
+            )
+
+    except Exception as e:
+        logger.error(f"Ошибка создания резервной копии: {e}")
+        await message.answer(
+            f"❌ *Ошибка создания резервной копии*\n\n"
+            f"Произошла ошибка: `{str(e)[:200]}`\n\n"
+            f"Проверьте права доступа к файловой системе.",
+            parse_mode="Markdown"
+        )
+
+# --- ДОПОЛНИТЕЛЬНЫЕ СЛУЖЕБНЫЕ КОМАНДЫ ---
+
+async def debug_command(message: Message):
+    """Обработчик команды /debug для отладочной информации"""
+    user_manager.add_user(message.from_user.id, message.from_user.username)
+    user_manager.record_activity(message.from_user.id, 'command')
+
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ У вас нет прав для выполнения этой команды.")
+        return
+
+    logger.info(f"🐛 Администратор запрашивает отладочную информацию")
+
+    try:
+        # Информация о системе
+        import psutil
+        import sys
+        
+        memory_info = psutil.virtual_memory()
+        disk_info = psutil.disk_usage('.')
+        
+        debug_info = (
+            f"🐛 *Отладочная информация*\n\n"
+            
+            f"💻 *Система:*\n"
+            f"• Python: {sys.version.split()[0]}\n"
+            f"• Платформа: {sys.platform}\n"
+            f"• ОЗУ: {memory_info.percent}% использовано\n"
+            f"• Диск: {disk_info.percent}% использовано\n\n"
+            
+            f"📁 *Файлы данных:*\n"
+        )
+        
+        data_files = [
+            (STATE_FILE, "Состояние релизов"),
+            (FILTERS_FILE, "Фильтры пользователей"),
+            (HISTORY_FILE, "История релизов"),
+            (USERS_FILE, "База пользователей"),
+            (PRIORITY_FILE, "Приоритеты репозиториев"),
+            (STATISTICS_FILE, "Статистика бота")
+        ]
+        
+        for file_path, description in data_files:
+            if os.path.exists(file_path):
+                size = os.path.getsize(file_path)
+                modified = datetime.fromtimestamp(os.path.getmtime(file_path))
+                debug_info += f"✅ {description}: {size:,} байт ({modified.strftime('%d.%m %H:%M')})\n"
+            else:
+                debug_info += f"❌ {description}: файл отсутствует\n"
+        
+        # Информация о GitHub API
+        debug_info += f"\n🔗 *GitHub API:*\n"
+        if GITHUB_TOKEN:
+            debug_info += f"✅ Токен настроен (длина: {len(GITHUB_TOKEN)} символов)\n"
+        else:
+            debug_info += f"⚠️ Токен не настроен (возможны ограничения)\n"
+        
+        # Статус планировщика
+        debug_info += f"\n⏰ *Планировщик:*\n"
+        try:
+            from apscheduler.schedulers.asyncio import AsyncIOScheduler
+            debug_info += f"✅ Модуль планировщика доступен\n"
+        except ImportError:
+            debug_info += f"❌ Модуль планировщика недоступен\n"
+        
+        await message.answer(debug_info, parse_mode="Markdown")
+        
+    except ImportError:
+        await message.answer(
+            "⚠️ Модуль psutil не установлен. Отладочная информация ограничена.",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Ошибка получения отладочной информации: {e}")
+        await message.answer(
+            f"❌ Ошибка получения отладочной информации: `{str(e)}`",
+            parse_mode="Markdown"
+        )
+
+async def logs_command(message: Message):
+    """Обработчик команды /logs для просмотра последних логов"""
+    user_manager.add_user(message.from_user.id, message.from_user.username)
+    user_manager.record_activity(message.from_user.id, 'command')
+
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ У вас нет прав для выполнения этой команды.")
+        return
+
+    logger.info(f"📋 Администратор запрашивает логи")
+
+    try:
+        log_dir = "logs"
+        today_log = f"{log_dir}/bot_{datetime.now().strftime('%Y%m%d')}.log"
+        error_log = f"{log_dir}/errors_{datetime.now().strftime('%Y%m%d')}.log"
+        
+        log_info = "📋 *Информация о логах*\n\n"
+        
+        # Основной лог
+        if os.path.exists(today_log):
+            size = os.path.getsize(today_log)
+            log_info += f"📝 *Основной лог:* {size:,} байт\n"
+            
+            # Читаем последние 10 строк
+            with open(today_log, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+                last_lines = lines[-10:] if len(lines) > 10 else lines
+                
+            if last_lines:
+                log_info += f"\n📖 *Последние записи:*\n'''"
+                for line in last_lines:
+                    # Ограничиваем длину строки
+                    if len(line) > 100:
+                        line = line[:97] + "...\n"
+                    log_info += line
+                log_info += "```\n"
+        else:
+            log_info += f"❌ Основной лог за сегодня не найден\n"
+        
+        # Лог ошибок
+        if os.path.exists(error_log):
+            size = os.path.getsize(error_log)
+            if size > 0:
+                log_info += f"\n⚠️ *Лог ошибок:* {size:,} байт\n"
+                
+                with open(error_log, 'r', encoding='utf-8') as f:
+                    lines = f.readlines()
+                    last_errors = lines[-5:] if len(lines) > 5 else lines
+                
+                if last_errors:
+                    log_info += f"\n🚨 *Последние ошибки:*\n```"
+                    for line in last_errors:
+                        if len(line) > 150:
+                            line = line[:147] + "...\n"
+                        log_info += line
+                    log_info += "```"
+            else:
+                log_info += f"\n✅ Ошибок за сегодня не было"
+        else:
+            log_info += f"\n✅ Лог ошибок не создан (ошибок не было)"
+        
+        await message.answer(log_info, parse_mode="Markdown")
+        
+    except Exception as e:
+        logger.error(f"Ошибка чтения логов: {e}")
+        await message.answer(
+            f"❌ Ошибка чтения логов: `{str(e)}`",
+            parse_mode="Markdown"
+        )
+
+# --- ОБРАБОТЧИК НЕИЗВЕСТНЫХ КОМАНД ---
+async def unknown_command(message: Message):
+    """Обработчик неизвестных команд"""
+    user_manager.add_user(message.from_user.id, message.from_user.username)
+    
+    command = message.text.split()[0] if message.text else "неизвестная команда"
+    logger.info(f"❓ Пользователь {message.from_user.id} использует неизвестную команду: {command}")
+    
+    await message.answer(
+        f"❓ *Неизвестная команда:* `{command}`\n\n"
+        f"📋 Используйте /help для просмотра доступных команд.\n\n"
+        f"💡 *Основные команды:*\n"
+        f"• /start — приветствие\n"
+        f"• /filter — настроить фильтры\n"
+        f"• /last — последние релизы\n"
+        f"• /help — полная справка",
+        parse_mode="Markdown"
+    )
+
+# --- MIDDLEWARE ДЛЯ ЛОГИРОВАНИЯ ---
+class LoggingMiddleware:
+    def __init__(self):
+        self.logger = logging.getLogger(__name__)
+
+    async def __call__(self, handler, event, data):
+        start_time = asyncio.get_event_loop().time()
+        
+        try:
+            # Логируем входящее событие
+            if hasattr(event, 'from_user') and event.from_user:
+                user_id = event.from_user.id
+                username = event.from_user.username or "None"
+                
+                if hasattr(event, 'text') and event.text:
+                    self.logger.info(f"📥 Сообщение от {user_id} (@{username}): {event.text[:50]}")
+                elif hasattr(event, 'data') and event.data:
+                    self.logger.info(f"📥 Callback от {user_id} (@{username}): {event.data}")
+            
+            # Выполняем обработчик
+            result = await handler(event, data)
+            
+            # Логируем время выполнения
+            execution_time = asyncio.get_event_loop().time() - start_time
+            if execution_time > 1.0:  # Логируем только медленные операции
+                self.logger.warning(f"⏱️ Медленная операция: {execution_time:.2f}с")
+            
+            return result
+            
+        except Exception as e:
+            execution_time = asyncio.get_event_loop().time() - start_time
+            self.logger.error(f"❌ Ошибка в middleware: {e} (время: {execution_time:.2f}с)")
+            raise
+
+# --- ОБРАБОТЧИК ОШИБОК ---
+async def error_handler(event, exception):
+    """Глобальный обработчик ошибок"""
+    logger.error(f"❌ Необработанная ошибка: {exception}")
+    logger.error(f"Traceback: {traceback.format_exc()}")
+    
+    # Уведомляем админа о критических ошибках
+    if ADMIN_ID:
+        try:
+            # Создаем экземпляр бота для отправки сообщения
+            # (это не идеальное решение, но работает)
+            error_message = (
+                f"🚨 *Критическая ошибка в боте*\n\n"
+                f"❌ Ошибка: `{str(exception)[:300]}`\n"
+                f"🕒 Время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"📍 Событие: {type(event).__name__}"
+            )
+            
+            # Попытка отправить через существующий бот
+            if hasattr(event, 'bot'):
+                await event.bot.send_message(ADMIN_ID, error_message, parse_mode="Markdown")
+        except:
+            pass  # Игнорируем ошибки отправки уведомлений об ошибках
 
 # --- РЕГИСТРАЦИЯ ОБРАБОТЧИКОВ ---
 def register_handlers(dp: Dispatcher):
-    print("Регистрация обработчиков...")
+    """Регистрирует все обработчики команд и событий"""
+    logger.info("📝 Регистрация обработчиков команд...")
+    
+    # Основные команды
     dp.message.register(start_command, CommandStart())
+    dp.message.register(help_command, Command("help"))
+    dp.message.register(donate_command, Command("donate"))
+    
+    # Команды управления фильтрами
     dp.message.register(filter_command, Command("filter"))
     dp.message.register(myfilters_command, Command("myfilters"))
     dp.message.register(clearfilters_command, Command("clearfilters"))
+    
+    # Команды просмотра данных
     dp.message.register(last_command, Command("last"))
-    dp.message.register(help_command, Command("help"))
+    
+    # Административные команды
     dp.message.register(stats_command, Command("stats"))
     dp.message.register(priority_command, Command("priority"))
     dp.message.register(pstats_command, Command("pstats"))
     dp.message.register(checkall_command, Command("checkall"))
-    dp.message.register(donate_command, Command("donate"))
-    dp.message.register(process_filter_text, F.text & ~F.command)
+    dp.message.register(backup_command, Command("backup"))
+    dp.message.register(debug_command, Command("debug"))
+    dp.message.register(logs_command, Command("logs"))
+    
+    # Обработчики callback-кнопок
     dp.callback_query.register(cancel_filter_callback, F.data == "cancel_filter")
-    print("Обработчики зарегистрированы")
+    
+    # Обработчик текста (для фильтров)
+    dp.message.register(process_filter_text, F.text & ~F.command)
+    
+    # Обработчик неизвестных команд (должен быть последним)
+    dp.message.register(unknown_command, F.text & F.text.startswith('/'))
+    
+    logger.info("✅ Все обработчики зарегистрированы")
 
+# --- ФУНКЦИЯ ОЧИСТКИ СТАРЫХ ФАЙЛОВ ---
+async def cleanup_old_files():
+    """Очищает старые файлы логов и резервных копий"""
+    logger.info("🧹 Запуск очистки старых файлов...")
+    
+    try:
+        # Очистка старых логов (старше 30 дней)
+        log_dir = "logs"
+        if os.path.exists(log_dir):
+            cutoff_date = datetime.now() - timedelta(days=30)
+            
+            for filename in os.listdir(log_dir):
+                file_path = os.path.join(log_dir, filename)
+                if os.path.isfile(file_path):
+                    file_time = datetime.fromtimestamp(os.path.getmtime(file_path))
+                    if file_time < cutoff_date:
+                        os.remove(file_path)
+                        logger.info(f"🗑️ Удален старый лог: {filename}")
+        
+        # Очистка старых резервных копий (старше 14 дней)
+        if os.path.exists(BACKUP_DIR):
+            cutoff_date = datetime.now() - timedelta(days=14)
+            
+            for item in os.listdir(BACKUP_DIR):
+                item_path = os.path.join(BACKUP_DIR, item)
+                if os.path.isdir(item_path):
+                    item_time = datetime.fromtimestamp(os.path.getmtime(item_path))
+                    if item_time < cutoff_date:
+                        shutil.rmtree(item_path)
+                        logger.info(f"🗑️ Удалена старая резервная копия: {item}")
+        
+        logger.info("✅ Очистка старых файлов завершена")
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка при очистке старых файлов: {e}")
 
-# --- MAIN ---
+# --- ФУНКЦИЯ ПРОВЕРКИ ЗДОРОВЬЯ БОТА ---
+async def health_check():
+    """Проверяет состояние бота и его компонентов"""
+    logger.info("🏥 Проверка состояния бота...")
+    
+    issues = []
+    
+    try:
+        # Проверка файлов данных
+        required_files = [STATE_FILE, USERS_FILE]
+        for file_path in required_files:
+            if not os.path.exists(file_path):
+                issues.append(f"Отсутствует обязательный файл: {file_path}")
+        
+        # Проверка размера файлов истории
+        if os.path.exists(HISTORY_FILE):
+            size = os.path.getsize(HISTORY_FILE)
+            if size > 50 * 1024 * 1024:  # 50 МБ
+                issues.append(f"Файл истории слишком большой: {size // 1024 // 1024} МБ")
+        
+        # Проверка статистики ошибок
+        error_rate = statistics_manager.stats.get('errors_count', 0)
+        total_checks = statistics_manager.stats.get('total_checks', 1)
+        if error_rate / max(total_checks, 1) > 0.1:  # Более 10% ошибок
+            issues.append(f"Высокий уровень ошибок: {error_rate}/{total_checks}")
+        
+        # Проверка дискового пространства
+        try:
+            import psutil
+            disk_usage = psutil.disk_usage('.')
+            if disk_usage.percent > 90:
+                issues.append(f"Мало места на диске: {disk_usage.percent}%")
+        except ImportError:
+            pass
+        
+        if issues:
+            logger.warning(f"⚠️ Обнаружены проблемы: {'; '.join(issues)}")
+            
+            # Уведомляем админа о критических проблемах
+            if ADMIN_ID and len(issues) > 3:
+                try:
+                    # Здесь нужно было бы отправить сообщение, но у нас нет доступа к боту
+                    # Эта функциональность может быть добавлена позже
+                    pass
+                except:
+                    pass
+        else:
+            logger.info("✅ Состояние бота в норме")
+            
+    except Exception as e:
+        logger.error(f"❌ Ошибка при проверке состояния: {e}")
+
+# --- ГЛАВНАЯ ФУНКЦИЯ ---
 async def main():
-    print("=== Запуск бота ===")
+    """Главная функция запуска бота"""
+    print("=" * 50)
+    print("🚀 ЗАПУСК БОТА МОНИТОРИНГА GITHUB РЕЛИЗОВ")
+    print("=" * 50)
 
+    # Проверка обязательных переменных
     if not BOT_TOKEN:
-        logger.error("BOT_TOKEN не найден в файле .env!")
-        print("ОШИБКА: BOT_TOKEN не найден в файле .env!")
+        logger.error("❌ BOT_TOKEN не найден в переменных окружения!")
+        print("КРИТИЧЕСКАЯ ОШИБКА: BOT_TOKEN не найден в файле .env!")
+        print("Пожалуйста, создайте файл .env и добавьте туда BOT_TOKEN=ваш_токен")
         return
 
-    print("Инициализация бота...")
-    bot = Bot(token=BOT_TOKEN, parse_mode="Markdown")
+    if not ADMIN_ID:
+        logger.error("❌ ADMIN_ID не найден в переменных окружения!")
+        print("ПРЕДУПРЕЖДЕНИЕ: ADMIN_ID не настроен. Административные функции будут недоступны.")
+
+    logger.info("🤖 Инициализация бота...")
+    print("🤖 Инициализация бота...")
+
+    # Создаем экземпляры бота и диспетчера
+    bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
 
-    print("Регистрация обработчиков...")
+    # Добавляем middleware для логирования
+    dp.message.middleware(LoggingMiddleware())
+    dp.callback_query.middleware(LoggingMiddleware())
+
+    # Устанавливаем обработчик ошибок
+    dp.errors.register(error_handler)
+
+    logger.info("📝 Регистрация обработчиков...")
+    print("📝 Регистрация обработчиков...")
     register_handlers(dp)
 
-    print("Настройка планировщика...")
-    scheduler = AsyncIOScheduler()
-
+    logger.info("⏰ Настройка планировщика задач...")
+    print("⏰ Настройка планировщика задач...")
+    
+    scheduler = AsyncIOScheduler(timezone="UTC")
+    
+    # Основная задача проверки репозиториев (каждые 15 минут)
     scheduler.add_job(
         check_repositories,
         'interval',
         minutes=15,
         kwargs={'bot': bot},
-        id='repositories_check'
+        id='repositories_check',
+        max_instances=1,  # Предотвращаем одновременный запуск
+        coalesce=True    # Объединяем пропущенные запуски
     )
 
+    # Обновление приоритетов (каждые 6 часов)
     scheduler.add_job(
         lambda: priority_manager.update_priorities(history_manager),
         'interval',
-        hours=24,
-        id='priority_update'
+        hours=6,
+        id='priority_update',
+        max_instances=1
     )
 
+    # Очистка старых файлов (каждый день в 03:00)
+    scheduler.add_job(
+        cleanup_old_files,
+        'cron',
+        hour=3,
+        minute=0,
+        id='cleanup_files',
+        max_instances=1
+    )
+
+    # Проверка здоровья бота (каждые 2 часа)
+    scheduler.add_job(
+        health_check,
+        'interval',
+        hours=2,
+        id='health_check',
+        max_instances=1
+    )
+
+    # Сохранение статистики (каждые 30 минут)
+    scheduler.add_job(
+        lambda: statistics_manager._save_stats(),
+        'interval',
+        minutes=30,
+        id='save_statistics',
+        max_instances=1
+    )
+
+    logger.info("✅ Планировщик настроен")
+    print("✅ Планировщик настроен")
+
+    # Запускаем планировщик
     scheduler.start()
+    logger.info("⏰ Планировщик запущен")
+    print("⏰ Планировщик запущен")
 
-    logger.info("Бот успешно запущен")
-    print("=== Бот запущен и готов к работе ===")
+    # Выводим информацию о конфигурации
+    print(f"\n📊 КОНФИГУРАЦИЯ БОТА:")
+    print(f"├── Отслеживается репозиториев: {len(REPOS)}")
+    print(f"├── GitHub токен: {'✅ Настроен' if GITHUB_TOKEN else '❌ Не настроен'}")
+    print(f"├── Канал для уведомлений: {'✅ ' + CHANNEL_ID if CHANNEL_ID else '❌ Не настроен'}")
+    print(f"├── Администратор: {'✅ ID=' + str(ADMIN_ID) if ADMIN_ID else '❌ Не настроен'}")
+    print(f"├── Интервал проверки: {MIN_CHECK_INTERVAL_MINUTES}-{MAX_CHECK_INTERVAL_MINUTES} мин")
+    print(f"└── Хранение истории: {HISTORY_DAYS} дней")
 
-    print("Запускаю первоначальную проверку репозиториев...")
+    logger.info("🎯 Выполнение первоначальной проверки репозиториев...")
+    print("\n🎯 Выполнение первоначальной проверки репозиториев...")
+    
     try:
-        # Используем принудительную проверку всех репозиториев при запуске
+        # Принудительная проверка всех репозиториев при запуске
         await check_all_repositories(bot)
-        print("Первоначальная проверка репозиториев завершена")
+        logger.info("✅ Первоначальная проверка завершена успешно")
+        print("✅ Первоначальная проверка завершена успешно")
     except Exception as e:
-        logger.error(f"Ошибка при первоначальной проверке: {e}")
-        print(f"ОШИБКА при первоначальной проверке: {e}")
+        logger.error(f"❌ Ошибка при первоначальной проверке: {e}")
+        print(f"⚠️ Ошибка при первоначальной проверке: {e}")
+        print("Бот будет продолжать работу, но некоторые данные могут быть неполными")
+
+    # Уведомляем админа о запуске
+    if ADMIN_ID:
+        try:
+            startup_message = (
+                f"🚀 *Бот успешно запущен!*\n\n"
+                f"⏰ Время запуска: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"📦 Отслеживается репозиториев: {len(REPOS)}\n"
+                f"👥 Пользователей в базе: {user_manager.get_count()}\n"
+                f"🔍 Пользователей с фильтрами: {filter_manager.get_users_with_filters_count()}\n"
+                f"📈 Релизов в истории: {history_manager.get_count()}\n\n"
+                f"Бот готов к работе! 🎉"
+            )
+            await bot.send_message(ADMIN_ID, startup_message, parse_mode="Markdown")
+        except Exception as e:
+            logger.warning(f"Не удалось отправить уведомление о запуске админу: {e}")
+
+    logger.info("🎉 Бот успешно запущен и готов к работе!")
+    print("\n" + "=" * 50)
+    print("🎉 БОТ УСПЕШНО ЗАПУЩЕН И ГОТОВ К РАБОТЕ!")
+    print("=" * 50)
+    print("📱 Используйте Ctrl+C для остановки бота")
+    print("📋 Логи сохраняются в папку logs/")
+    print("💾 Резервные копии создаются в папку backups/")
+    print("=" * 50 + "\n")
 
     try:
-        print("Начинаю получение обновлений...")
-        await dp.start_polling(bot)
+        # Начинаем получение обновлений
+        await dp.start_polling(bot, skip_updates=True)
+    except KeyboardInterrupt:
+        logger.info("⏹️ Получен сигнал остановки от пользователя")
+        print("\n⏹️ Получен сигнал остановки...")
     except Exception as e:
-        logger.error(f"Ошибка при запуске поллинга: {e}")
-        print(f"ОШИБКА: {e}")
+        logger.error(f"❌ Критическая ошибка при запуске поллинга: {e}")
+        print(f"\n❌ Критическая ошибка: {e}")
+        print("Проверьте логи для получения подробной информации")
     finally:
-        print("Завершение работы бота...")
-        await bot.session.close()
-        scheduler.shutdown()
+        logger.info("🛑 Завершение работы бота...")
+        print("🛑 Завершение работы бота...")
+        
+        # Останавливаем планировщик
+        try:
+            scheduler.shutdown(wait=True)
+            logger.info("⏰ Планировщик остановлен")
+            print("⏰ Планировщик остановлен")
+        except Exception as e:
+            logger.error(f"Ошибка остановки планировщика: {e}")
 
+        # Сохраняем финальную статистику
+        try:
+            statistics_manager._save_stats()
+            logger.info("💾 Финальная статистика сохранена")
+            print("💾 Финальная статистика сохранена")
+        except Exception as e:
+            logger.error(f"Ошибка сохранения статистики: {e}")
 
+        # Закрываем сессию бота
+        try:
+            await bot.session.close()
+            logger.info("🔌 Сессия бота закрыта")
+            print("🔌 Сессия бота закрыта")
+        except Exception as e:
+            logger.error(f"Ошибка закрытия сессии: {e}")
+
+        # Уведомляем админа об остановке
+        if ADMIN_ID:
+            try:
+                shutdown_message = (
+                    f"🛑 *Бот остановлен*\n\n"
+                    f"⏰ Время остановки: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"📊 Время работы: {statistics_manager.get_uptime()}\n"
+                    f"📈 Всего проверок: {statistics_manager.stats['total_checks']}\n"
+                    f"🔔 Всего уведомлений: {statistics_manager.stats['total_notifications_sent']}\n\n"
+                    f"До свидания! 👋"
+                )
+                # Создаем новую сессию для отправки последнего сообщения
+                final_bot = Bot(token=BOT_TOKEN)
+                await final_bot.send_message(ADMIN_ID, shutdown_message, parse_mode="Markdown")
+                await final_bot.session.close()
+            except:
+                pass  # Игнорируем ошибки при завершении
+
+        logger.info("✅ Бот полностью остановлен")
+        print("✅ Бот полностью остановлен")
+
+# --- ТОЧКА ВХОДА ---
 if __name__ == "__main__":
     try:
-        print("=== Запуск приложения ===")
+        logger.info("🚀 Запуск приложения...")
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Бот остановлен пользователем")
-        print("Бот остановлен пользователем")
+        print("\n👋 Бот остановлен пользователем")
     except Exception as e:
-        logger.error(f"Критическая ошибка: {e}")
-        print(f"КРИТИЧЕСКАЯ ОШИБКА: {e}")
-        raise
+        logger.error(f"💥 Критическая ошибка при запуске: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        print(f"\n💥 КРИТИЧЕСКАЯ ОШИБКА: {e}")
+        print("Проверьте логи для получения подробной информации")
+        sys.exit(1)
+
