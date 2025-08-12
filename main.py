@@ -877,7 +877,6 @@ def escape_markdown(text: str) -> str:
 
     return escaped_text
 
-# --- УЛУЧШЕННОЕ ФОРМАТИРОВАНИЕ СООБЩЕНИЯ ---
 def format_release_message(repo_name: str, release: Dict) -> str:
     """Форматирует сообщение о релизе"""
     tag = release.get('tag_name', 'Unknown')
@@ -885,68 +884,60 @@ def format_release_message(repo_name: str, release: Dict) -> str:
     body = release.get('body', '')
     published_at = release.get('published_at', '')
     assets = release.get('assets', [])
-
     # Экранируем текст
     repo_name_escaped = escape_markdown(repo_name)
     name_escaped = escape_markdown(name)
     tag_escaped = escape_markdown(tag)
-
     message = (
         f"🚀 *Новый релиз в репозитории {repo_name_escaped}*\n\n"
         f"*{name_escaped}*\n"
         f"`{tag_escaped}`\n"
     )
-
-    # Добавляем дату публикации
+    # Добавляем дату публикации в МСК
     if published_at:
         try:
             pub_date = datetime.fromisoformat(published_at.replace('Z', '+00:00'))
-            formatted_date = pub_date.strftime('%Y-%m-%d %H:%M UTC')
+            # Преобразуем в МСК (UTC+3)
+            msk_time = pub_date + timedelta(hours=3)
+            formatted_date = msk_time.strftime('%Y-%m-%d %H:%M МСК')
             message += f"📅 {formatted_date}\n\n"
         except Exception as e:
             logger.warning(f"Не удалось распарсить дату: {published_at}, ошибка: {e}")
             message += "\n"
     else:
         message += "\n"
-
     # Добавляем описание (с ограничением длины)
     if body:
         # Убираем лишние символы и ограничиваем длину
         body_clean = body.strip()
         if len(body_clean) > 1000:
             body_clean = body_clean[:1000] + "..."
-        
+
         body_escaped = escape_markdown(body_clean)
         message += f"{body_escaped}\n\n"
-
     # Добавляем ссылки для скачивания
     download_links = []
     for asset in assets:
         if isinstance(asset, dict):
             asset_name = asset.get('name', '')
             download_url = asset.get('browser_download_url', '')
-            
+
             # Исключаем исходный код
-            if (asset_name and download_url and 
-                not asset_name.startswith("Source code") and
-                not asset_name.endswith(".zip") or not asset_name.endswith(".tar.gz")):
-                
+            if (asset_name and download_url and
+                    not asset_name.startswith("Source code") and
+                    not (asset_name.endswith(".zip") or asset_name.endswith(".tar.gz"))):
                 asset_name_escaped = escape_markdown(asset_name[:50])  # Ограничиваем длину имени
                 download_links.append(f"[{asset_name_escaped}]({download_url})")
-
     if download_links:
         message += "📥 *Ссылки для скачивания:*\n" + "\n".join(download_links[:10])  # Максимум 10 ссылок
     else:
         message += "⚠️ Файлы для скачивания не найдены"
-
     # Добавляем ссылку на релиз
     release_url = release.get('html_url')
     if release_url:
         message += f"\n\n🔗 [Открыть на GitHub]({release_url})"
-
     return message
 
-# --- ЗНАЧИТЕЛЬНО УЛУЧШЕННАЯ ОТПРАВКА УВЕДОМЛЕНИЙ ---
 async def send_notifications(bot: Bot, repo_name: str, release: Dict) -> int:
     """Отправляет уведомления о новом релизе
     
