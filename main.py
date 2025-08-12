@@ -864,16 +864,17 @@ def escape_markdown(text: str) -> str:
     """Экранирует специальные символы Markdown"""
     if not text:
         return ""
-    
-    escape_chars = '_*`[]()~>#+-=|{}.!'
+
+    # Список символов, которые действительно нужно экранировать в MarkdownV2
+    escape_chars = '_*[]()~>#+`=|{}!'
     escaped_text = ""
-    
+
     for char in text:
         if char in escape_chars:
             escaped_text += f'\\{char}'
         else:
             escaped_text += char
-    
+
     return escaped_text
 
 # --- УЛУЧШЕННОЕ ФОРМАТИРОВАНИЕ СООБЩЕНИЯ ---
