@@ -859,17 +859,30 @@ def matches_filters(release_data: dict, keywords: List[str]) -> bool:
     # Проверяем наличие всех ключевых слов
     return all(keyword.lower() in search_text for keyword in keywords)
 
-# --- ЭКРАНИРОВАНИЕ СИМВОЛОВ MARKDOWN ---
+
 def escape_markdown(text: str) -> str:
     """Экранирует специальные символы Markdown"""
     if not text:
         return ""
 
-    # Список символов, которые действительно нужно экранировать в MarkdownV2
+    # Список символов, которые нужно экранировать в MarkdownV2
     escape_chars = '_*[]()~>#+`=|{}!'
-    escaped_text = ""
 
-    for char in text:
+    # Сначала удаляем существующие экранирующие слэши перед этими символами
+    cleaned_text = ""
+    i = 0
+    while i < len(text):
+        if text[i] == '\\' and i + 1 < len(text) and text[i + 1] in escape_chars:
+            # Пропускаем обратный слэш, оставляем только символ
+            cleaned_text += text[i + 1]
+            i += 2
+        else:
+            cleaned_text += text[i]
+            i += 1
+
+    # Теперь экранируем нужные символы
+    escaped_text = ""
+    for char in cleaned_text:
         if char in escape_chars:
             escaped_text += f'\\{char}'
         else:
