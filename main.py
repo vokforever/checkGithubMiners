@@ -7,6 +7,7 @@ import locale
 import ctypes
 import traceback
 import shutil
+import re
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Optional, List, Set, Tuple
 from aiohttp import ClientSession, ClientError, ClientResponseError
@@ -891,21 +892,24 @@ def escape_markdown(text: str) -> str:
     return escaped_text
 
 def format_release_message(repo_name: str, release: Dict) -> str:
-    """Форматирует сообщение о релизе"""
+    """Форматирует сообщение о релизе с очисткой от Markdown"""
     tag = release.get('tag_name', 'Unknown')
     name = release.get('name', tag)
     body = release.get('body', '')
     published_at = release.get('published_at', '')
     assets = release.get('assets', [])
-    # Экранируем текст
-    repo_name_escaped = escape_markdown(repo_name)
-    name_escaped = escape_markdown(name)
-    tag_escaped = escape_markdown(tag)
+    
+    # Очищаем текст от Markdown форматирования
+    repo_name_clean = clean_markdown_text(repo_name)
+    name_clean = clean_markdown_text(name)
+    tag_clean = clean_markdown_text(tag)
+    
     message = (
-        f"🚀 *Новый релиз в репозитории {repo_name_escaped}*\n\n"
-        f"*{name_escaped}*\n"
-        f"`{tag_escaped}`\n"
+        f"🚀 *Новый релиз в репозитории {repo_name_clean}*\n\n"
+        f"*{name_clean}*\n"
+        f"`{tag_clean}`\n"
     )
+    
     # Добавляем дату публикации в МСК
     if published_at:
         try:
@@ -919,19 +923,20 @@ def format_release_message(repo_name: str, release: Dict) -> str:
             message += "\n"
     else:
         message += "\n"
-    # Добавляем описание (с ограничением длины)
+    
+    # Добавляем описание (с очисткой от Markdown)
     if body:
+        # Очищаем от Markdown форматирования
+        body_clean = clean_markdown_text(body.strip())
+        
         # Убираем лишние символы и ограничиваем длину
-        body_clean = body.strip()
-        
-        # Заменяем проблемные символы для лучшего отображения в Telegram
-        body_clean = body_clean.replace('\\', '\\\\')  # Экранируем обратные слэши
-        
         if len(body_clean) > 1000:
             body_clean = body_clean[:1000] + "..."
 
+        # Экранируем специальные символы для Markdown
         body_escaped = escape_markdown(body_clean)
         message += f"{body_escaped}\n\n"
+    
     # Добавляем ссылки для скачивания
     download_links = []
     for asset in assets:
@@ -942,16 +947,20 @@ def format_release_message(repo_name: str, release: Dict) -> str:
             # Исключаем только исходный код, но показываем все исполняемые файлы
             if (asset_name and download_url and
                     not asset_name.startswith("Source code")):
-                asset_name_escaped = escape_markdown(asset_name[:50])  # Ограничиваем длину имени
+                asset_name_clean = clean_markdown_text(asset_name[:50])  # Очищаем и ограничиваем длину
+                asset_name_escaped = escape_markdown(asset_name_clean)
                 download_links.append(f"[{asset_name_escaped}]({download_url})")
+    
     if download_links:
         message += "📥 *Ссылки для скачивания:*\n" + "\n".join(download_links[:10])  # Максимум 10 ссылок
     else:
         message += "⚠️ Файлы для скачивания не найдены"
+    
     # Добавляем ссылку на релиз
     release_url = release.get('html_url')
     if release_url:
         message += f"\n\n🔗 [Открыть на GitHub]({release_url})"
+    
     return message
 
 async def send_notifications(bot: Bot, repo_name: str, release: Dict) -> int:
@@ -2428,4 +2437,34 @@ if __name__ == "__main__":
         print(f"\n💥 КРИТИЧЕСКАЯ ОШИБКА: {e}")
         print("Проверьте логи для получения подробной информации")
         sys.exit(1)
+
+# --- ФУНКЦИЯ ОЧИСТКИ MARKDOWN ---
+def clean_markdown_text(text: str) -> str:
+    """
+    Удаляет символы Markdown форматирования из текста
+    """
+    if not text:
+        return text
+    
+    # Удаляем жирное форматирование **text**
+    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
+    
+    # Удаляем курсив __text__
+    text = re.sub(r'__(.*?)__', r'\1', text)
+    
+    # Удаляем моноширинный ```text```
+    text = re.sub(r'```(.*?)```', r'\1', text)
+    
+    # Удаляем зачеркнутый ~~text~~
+    text = re.sub(r'~~(.*?)~~', r'\1', text)
+    
+    # Удаляем скрытый ||text||
+    text = re.sub(r'\|\|(.*?)\|\|', r'\1', text)
+    
+    # Удаляем одиночные символы форматирования, которые могут остаться
+    text = re.sub(r'[\*_~`|]', '', text)
+    
+    return text.strip()
+
+# --- ФУНКЦИЯ ЭКРАНИРОВАНИЯ MARKDOWN ---
 
