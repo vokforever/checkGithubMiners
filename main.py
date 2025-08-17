@@ -188,7 +188,7 @@ class StatisticsManager:
         except:
             return "Неизвестно"
 
-# --- УЛУЧШЕННЫЙ КЛАСС ДЛЯ УПРАВЛЕНИЯ ПРИОРИТЕТАМИ ---
+# --- УЛУЧШЕНЫЙ КЛАСС ДЛЯ УПРАВЛЕНИЯ ПРИОРИТЕТАМИ ---
 class RepositoryPriorityManager:
     def __init__(self):
         self.priority_file = PRIORITY_FILE
@@ -861,12 +861,12 @@ def matches_filters(release_data: dict, keywords: List[str]) -> bool:
 
 
 def escape_markdown(text: str) -> str:
-    """Экранирует специальные символы Markdown"""
+    """Экранирует специальные символы Markdown (не MarkdownV2)"""
     if not text:
         return ""
 
-    # Список символов, которые нужно экранировать в MarkdownV2
-    escape_chars = '_*[]()~>#+`=|{}!'
+    # Список символов, которые нужно экранировать в Markdown
+    escape_chars = '_*[]()~`>#+='
 
     # Сначала удаляем существующие экранирующие слэши перед этими символами
     cleaned_text = ""
@@ -923,6 +923,10 @@ def format_release_message(repo_name: str, release: Dict) -> str:
     if body:
         # Убираем лишние символы и ограничиваем длину
         body_clean = body.strip()
+        
+        # Заменяем проблемные символы для лучшего отображения в Telegram
+        body_clean = body_clean.replace('\\', '\\\\')  # Экранируем обратные слэши
+        
         if len(body_clean) > 1000:
             body_clean = body_clean[:1000] + "..."
 
