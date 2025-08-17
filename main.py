@@ -154,6 +154,224 @@ def clean_markdown_text(text: str) -> str:
     
     return text.strip()
 
+def clean_ai_response(text: str) -> str:
+    """
+    Очищает ответ ИИ от служебных тегов и разметки
+    """
+    if not text:
+        return text
+    
+    # Удаляем типичные служебные теги
+    text = re.sub(r'</?think>', '', text)
+    text = re.sub(r'</?sys>', '', text)
+    text = re.sub(r'</?ai>', '', text)
+    text = re.sub(r'</?user>', '', text)
+    text = re.sub(r'</?assistant>', '', text)
+    
+    # Удаляем HTML/XML теги
+    text = re.sub(r'<[^>]+>', '', text)
+    
+    # Удаляем Markdown форматирование
+    text = clean_markdown_text(text)
+    
+    # Дополнительная очистка от специфичных артефактов
+    text = re.sub(r'\[.*?\]', '', text)  # Удаляем текст в квадратных скобках
+    text = re.sub(r'\{.*?\}', '', text)  # Удаляем текст в фигурных скобках
+    
+    # Удаляем лишние пробелы и переносы строк
+    text = re.sub(r'\n\s*\n\s*\n', '\n\n', text)  # Максимум 2 пустые строки подряд
+    text = re.sub(r' +', ' ', text)  # Убираем множественные пробелы
+    
+    return text.strip()
+
+def escape_markdown(text: str) -> str:
+    """Экранирует специальные символы Markdown (не MarkdownV2)"""
+    if not text:
+        return ""
+
+    # Список символов, которые нужно экранировать в Markdown
+    escape_chars = '_*[]()~`>#+='
+
+    # Сначала удаляем существующие экранирующие слэши перед этими символами
+    cleaned_text = ""
+    i = 0
+    while i < len(text):
+        if text[i] == '\\' and i + 1 < len(text) and text[i + 1] in escape_chars:
+            # Пропускаем обратный слэш, оставляем только символ
+            cleaned_text += text[i + 1]
+            i += 2
+        else:
+            cleaned_text += text[i]
+            i += 1
+
+    # Теперь экранируем нужные символы
+    escaped_text = ""
+    for char in cleaned_text:
+        if char in escape_chars:
+            escaped_text += f'\\{char}'
+        else:
+            escaped_text += char
+
+    return escaped_text
+
+def escape_markdown_v2(text: str) -> str:
+    """
+    Экранирует специальные символы для MarkdownV2 (более строгий режим)
+    """
+    if not text:
+        return ""
+    
+    # Список символов для MarkdownV2
+    escape_chars = '_*[]()~`>#+=|{}.!'
+    
+    escaped_text = ""
+    for char in text:
+        if char in escape_chars:
+            escaped_text += f'\\{char}'
+        else:
+            escaped_text += char
+    
+    return escaped_text
+
+def validate_telegram_text(text: str, max_length: int = 4096) -> str:
+    """
+    Проверяет и подготавливает текст для отправки в Telegram
+    
+    Args:
+        text: Исходный текст
+        max_length: Максимальная длина сообщения (по умолчанию 4096 для Telegram)
+    
+    Returns:
+        str: Подготовленный текст
+    """
+    if not text:
+        return ""
+    
+    # Ограничиваем длину сообщения
+    if len(text) > max_length:
+        # Пытаемся обрезать по словам, а не по символам
+        words = text[:max_length-3].rsplit(' ', 1)
+        if len(words) > 1:
+            text = words[0] + "..."
+        else:
+            text = text[:max_length-3] + "..."
+    
+    # Очищаем от служебных тегов
+    text = clean_ai_response(text)
+    
+    return text
+
+def clean_github_release_body(body: str, max_length: int = 1000) -> str:
+    """
+    Специализированная очистка для описания релизов GitHub
+    
+    Args:
+        body: Описание релиза
+        max_length: Максимальная длина
+    
+    Returns:
+        str: Очищенное описание
+    """
+    if not body:
+        return ""
+    
+    # Очищаем от Markdown
+    cleaned = clean_markdown_text(body.strip())
+    
+    # Удаляем специфичные для GitHub элементы
+    cleaned = re.sub(r'<!--.*?-->', '', cleaned, flags=re.DOTALL)  # HTML комментарии
+    cleaned = re.sub(r'\[.*?\]\(.*?\)', '', cleaned)  # Markdown ссылки
+    cleaned = re.sub(r'!\[.*?\]\(.*?\)', '', cleaned)  # Markdown изображения
+    
+    # Убираем лишние пробелы и переносы
+    cleaned = re.sub(r'\n\s*\n\s*\n', '\n\n', cleaned)
+    cleaned = re.sub(r' +', ' ', cleaned)
+    
+    # Ограничиваем длину
+    if len(cleaned) > max_length:
+        # Пытаемся обрезать по предложениям
+        sentences = cleaned[:max_length-3].rsplit('.', 1)
+        if len(sentences) > 1:
+            cleaned = sentences[0] + "..."
+        else:
+            cleaned = cleaned[:max_length-3] + "..."
+    
+    return cleaned.strip()
+
+def format_telegram_message_safe(text: str, parse_mode: str = None) -> tuple[str, str]:
+    """
+    Безопасно форматирует сообщение для Telegram
+    
+    Args:
+        text: Исходный текст
+        parse_mode: Режим парсинга (None, 'Markdown', 'MarkdownV2', 'HTML')
+    
+    Returns:
+        tuple: (подготовленный_текст, рекомендуемый_режим_парсинга)
+    """
+    if not text:
+        return "", None
+    
+    # Очищаем от служебных тегов
+    cleaned_text = clean_ai_response(text)
+    
+    # Проверяем длину
+    validated_text = validate_telegram_text(cleaned_text)
+    
+    # Определяем рекомендуемый режим парсинга
+    if parse_mode is None:
+        # Анализируем текст и рекомендуем режим
+        if re.search(r'[*_`~|]', validated_text):
+            # Есть символы Markdown - используем HTML для безопасности
+            recommended_mode = 'HTML'
+            # Конвертируем Markdown в HTML
+            validated_text = convert_markdown_to_html(validated_text)
+        else:
+            recommended_mode = None
+    else:
+        recommended_mode = parse_mode
+    
+    return validated_text, recommended_mode
+
+def convert_markdown_to_html(text: str) -> str:
+    """
+    Конвертирует простые Markdown элементы в HTML
+    """
+    if not text:
+        return text
+    
+    # Жирный текст
+    text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
+    
+    # Курсив
+    text = re.sub(r'__(.*?)__', r'<i>\1</i>', text)
+    
+    # Моноширинный
+    text = re.sub(r'```(.*?)```', r'<code>\1</code>', text)
+    
+    # Зачеркнутый
+    text = re.sub(r'~~(.*?)~~', r'<s>\1</s>', text)
+    
+    # Подчеркнутый
+    text = re.sub(r'<u>(.*?)</u>', r'<u>\1</u>', text)
+    
+    return text
+
+def clean_telegram_username(username: str) -> str:
+    """
+    Очищает username для безопасного использования в Telegram
+    """
+    if not username:
+        return ""
+    
+    # Убираем символ @ если есть
+    username = username.lstrip('@')
+    
+    # Убираем недопустимые символы
+    username = re.sub(r'[^\w\d_]', '', username)
+    
+    return username[:32]  # Telegram ограничение на длину username
+
 # --- КЛАСС ДЛЯ УПРАВЛЕНИЯ СТАТИСТИКОЙ ---
 class StatisticsManager:
     def __init__(self):
@@ -888,39 +1106,8 @@ def matches_filters(release_data: dict, keywords: List[str]) -> bool:
     # Проверяем наличие всех ключевых слов
     return all(keyword.lower() in search_text for keyword in keywords)
 
-
-def escape_markdown(text: str) -> str:
-    """Экранирует специальные символы Markdown (не MarkdownV2)"""
-    if not text:
-        return ""
-
-    # Список символов, которые нужно экранировать в Markdown
-    escape_chars = '_*[]()~`>#+='
-
-    # Сначала удаляем существующие экранирующие слэши перед этими символами
-    cleaned_text = ""
-    i = 0
-    while i < len(text):
-        if text[i] == '\\' and i + 1 < len(text) and text[i + 1] in escape_chars:
-            # Пропускаем обратный слэш, оставляем только символ
-            cleaned_text += text[i + 1]
-            i += 2
-        else:
-            cleaned_text += text[i]
-            i += 1
-
-    # Теперь экранируем нужные символы
-    escaped_text = ""
-    for char in cleaned_text:
-        if char in escape_chars:
-            escaped_text += f'\\{char}'
-        else:
-            escaped_text += char
-
-    return escaped_text
-
 def format_release_message(repo_name: str, release: Dict) -> str:
-    """Форматирует сообщение о релизе с очисткой от Markdown"""
+    """Форматирует сообщение о релизе с улучшенной очисткой от Markdown"""
     tag = release.get('tag_name', 'Unknown')
     name = release.get('name', tag)
     body = release.get('body', '')
@@ -952,15 +1139,11 @@ def format_release_message(repo_name: str, release: Dict) -> str:
     else:
         message += "\n"
     
-    # Добавляем описание (с очисткой от Markdown)
+    # Добавляем описание (с улучшенной очисткой от Markdown)
     if body:
-        # Очищаем от Markdown форматирования
-        body_clean = clean_markdown_text(body.strip())
+        # Используем специализированную функцию для GitHub релизов
+        body_clean = clean_github_release_body(body, max_length=1000)
         
-        # Убираем лишние символы и ограничиваем длину
-        if len(body_clean) > 1000:
-            body_clean = body_clean[:1000] + "..."
-
         # Экранируем специальные символы для Markdown
         body_escaped = escape_markdown(body_clean)
         message += f"{body_escaped}\n\n"
