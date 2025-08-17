@@ -19,6 +19,14 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
+# Импорт современного форматтера
+try:
+    from modern_telegram_formatter import formatter, convert_markdown_to_telegram
+    MODERN_FORMATTER_AVAILABLE = True
+except ImportError:
+    MODERN_FORMATTER_AVAILABLE = False
+    logging.warning("Современный форматтер не доступен, используются базовые функции")
+
 # --- НАСТРОЙКА КОДИРОВКИ ДЛЯ WINDOWS ---
 if sys.platform == "win32":
     # Включаем поддержку UTF-8 в консоли Windows
@@ -154,19 +162,12 @@ def clean_markdown_text(text: str) -> str:
     
     return text.strip()
 
-def clean_ai_response(text: str) -> str:
+def clean_text_for_telegram(text: str) -> str:
     """
-    Очищает ответ ИИ от служебных тегов и разметки
+    Очищает текст от служебных тегов и разметки для отправки в Telegram
     """
     if not text:
         return text
-    
-    # Удаляем типичные служебные теги
-    text = re.sub(r'</?think>', '', text)
-    text = re.sub(r'</?sys>', '', text)
-    text = re.sub(r'</?ai>', '', text)
-    text = re.sub(r'</?user>', '', text)
-    text = re.sub(r'</?assistant>', '', text)
     
     # Удаляем HTML/XML теги
     text = re.sub(r'<[^>]+>', '', text)
@@ -257,7 +258,7 @@ def validate_telegram_text(text: str, max_length: int = 4096) -> str:
             text = text[:max_length-3] + "..."
     
     # Очищаем от служебных тегов
-    text = clean_ai_response(text)
+    text = clean_text_for_telegram(text)
     
     return text
 
@@ -312,8 +313,23 @@ def format_telegram_message_safe(text: str, parse_mode: str = None) -> tuple[str
     if not text:
         return "", None
     
+    # Используем современный форматтер, если доступен
+    if MODERN_FORMATTER_AVAILABLE:
+        try:
+            # Автоматически определяем лучший формат
+            formatted_text, recommended_mode = convert_markdown_to_telegram(text, "auto")
+            
+            # Проверяем длину
+            validated_text = validate_telegram_text(formatted_text)
+            
+            return validated_text, recommended_mode
+            
+        except Exception as e:
+            logging.error(f"Ошибка современного форматтера: {e}, используем fallback")
+    
+    # Fallback на старую логику
     # Очищаем от служебных тегов
-    cleaned_text = clean_ai_response(text)
+    cleaned_text = clean_text_for_telegram(text)
     
     # Проверяем длину
     validated_text = validate_telegram_text(cleaned_text)
@@ -348,6 +364,80 @@ def convert_markdown_to_html(text: str) -> str:
     
     # Моноширинный
     text = re.sub(r'```(.*?)```', r'<code>\1</code>', text)
+
+async def send_formatted_message(bot: Bot, chat_id: int, text: str, 
+                               target_format: str = "auto", 
+                               max_length: int = 4096) -> bool:
+    """
+    Отправляет отформатированное сообщение с автоматическим выбором режима
+    
+    Args:
+        bot: Экземпляр бота
+        chat_id: ID чата для отправки
+        text: Текст для отправки
+        target_format: Целевой формат ("auto", "markdown_v2", "html")
+        max_length: Максимальная длина сообщения
+    
+    Returns:
+        bool: True если сообщение отправлено успешно
+    """
+    if not text:
+        return False
+    
+    try:
+        # Используем современный форматтер, если доступен
+        if MODERN_FORMATTER_AVAILABLE:
+            try:
+                # Конвертируем текст
+                formatted_text, parse_mode = convert_markdown_to_telegram(text, target_format)
+                
+                # Разбиваем длинные сообщения
+                if len(formatted_text) > max_length:
+                    message_parts = formatter.split_long_message(formatted_text, max_length)
+                    
+                    for part in message_parts:
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text=part,
+                            parse_mode=parse_mode
+                        )
+                else:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=formatted_text,
+                        parse_mode=parse_mode
+                    )
+                
+                return True
+                
+            except Exception as e:
+                logging.error(f"Ошибка современного форматтера: {e}, используем fallback")
+        
+        # Fallback на старую логику
+        formatted_text, parse_mode = format_telegram_message_safe(text)
+        
+        if len(formatted_text) > max_length:
+            # Простое разбиение по длине
+            parts = [formatted_text[i:i+max_length] for i in range(0, len(formatted_text), max_length)]
+            
+            for part in parts:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=part,
+                    parse_mode=parse_mode
+                )
+        else:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=formatted_text,
+                parse_mode=parse_mode
+            )
+        
+        return True
+        
+    except Exception as e:
+        logging.error(f"Ошибка отправки сообщения: {e}")
+        return False
     
     # Зачеркнутый
     text = re.sub(r'~~(.*?)~~', r'<s>\1</s>', text)
