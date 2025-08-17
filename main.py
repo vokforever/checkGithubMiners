@@ -935,10 +935,9 @@ def format_release_message(repo_name: str, release: Dict) -> str:
             asset_name = asset.get('name', '')
             download_url = asset.get('browser_download_url', '')
 
-            # Исключаем исходный код
+            # Исключаем только исходный код, но показываем все исполняемые файлы
             if (asset_name and download_url and
-                    not asset_name.startswith("Source code") and
-                    not (asset_name.endswith(".zip") or asset_name.endswith(".tar.gz"))):
+                    not asset_name.startswith("Source code")):
                 asset_name_escaped = escape_markdown(asset_name[:50])  # Ограничиваем длину имени
                 download_links.append(f"[{asset_name_escaped}]({download_url})")
     if download_links:
