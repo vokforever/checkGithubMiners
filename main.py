@@ -542,19 +542,19 @@ class RepositoryPriorityManager:
         except Exception as e:
             logger.error(f"Ошибка инициализации SupabaseManager: {e}")
 
-    async def _load_priorities_from_db(self) -> Dict[str, Dict]:
+    def _load_priorities_from_db(self) -> Dict[str, Dict]:
         """Загружает приоритеты из базы данных Supabase"""
         if not self.supabase_manager:
             logger.error("SupabaseManager недоступен, невозможно загрузить приоритеты")
             raise RuntimeError("SupabaseManager недоступен")
 
         try:
-            # Получаем данные из базы
-            result = await self.supabase_manager.client.table('checkgithub_repository_priorities').select('*').execute()
+            # Получаем данные из базы через SupabaseManager
+            result = self.supabase_manager.get_repository_priorities()
             
-            if result.data:
+            if result:
                 db_priorities = {}
-                for record in result.data:
+                for record in result:
                     repo_name = record.get('repo_name')
                     if repo_name in REPOS:
                         db_priorities[repo_name] = {
@@ -584,9 +584,9 @@ class RepositoryPriorityManager:
             logger.error(f"Ошибка загрузки приоритетов из БД: {e}")
             raise RuntimeError(f"Не удалось загрузить приоритеты из БД: {e}")
 
-    async def initialize_priorities(self):
+    def initialize_priorities(self):
         """Инициализирует приоритеты при запуске"""
-        self.priorities = await self._load_priorities_from_db()
+        self.priorities = self._load_priorities_from_db()
         self.last_priority_update = datetime.now(timezone.utc)
 
     def _create_default_priority(self) -> Dict:
@@ -601,21 +601,17 @@ class RepositoryPriorityManager:
             'average_response_time': 0.0
         }
 
-    async def _save_priorities_to_db(self):
+    def _save_priorities_to_db(self):
         """Сохраняет приоритеты в базу данных Supabase"""
         if not self.supabase_manager:
             logger.error("SupabaseManager недоступен, невозможно сохранить приоритеты")
             raise RuntimeError("SupabaseManager недоступен")
 
         try:
-            repos_data = []
+            # Подготавливаем данные для сохранения
+            priorities_data = {}
             for repo_name, repo_data in self.priorities.items():
-                # Определяем уровень приоритета
-                priority_level = self._get_priority_level(repo_data.get('priority_score', 0))
-                
-                repo_record = {
-                    'repo_name': repo_name,
-                    'display_name': repo_name.split('/')[-1],
+                priorities_data[repo_name] = {
                     'update_count': repo_data.get('update_count', 0),
                     'last_update': repo_data.get('last_update'),
                     'check_interval': repo_data.get('check_interval', DEFAULT_CHECK_INTERVAL_MINUTES),
@@ -623,20 +619,12 @@ class RepositoryPriorityManager:
                     'last_check': repo_data.get('last_check'),
                     'consecutive_failures': repo_data.get('consecutive_failures', 0),
                     'total_checks': repo_data.get('total_checks', 0),
-                    'average_response_time': repo_data.get('average_response_time', 0.0),
-                    'priority_level': priority_level,
-                    'priority_color': self._get_priority_color(repo_data.get('priority_score', 0)),
-                    'updated_at': 'now()'
+                    'average_response_time': repo_data.get('average_response_time', 0.0)
                 }
-                repos_data.append(repo_record)
-
-            # Upsert данные в БД
-            result = await self.supabase_manager.client.table('checkgithub_repository_priorities').upsert(
-                repos_data,
-                on_conflict='repo_name'
-            ).execute()
-
-            logger.info(f"Приоритеты успешно сохранены в БД: {len(repos_data)} репозиториев")
+            
+            # Сохраняем через SupabaseManager
+            self.supabase_manager.store_repository_priorities({'priorities': priorities_data})
+            logger.info(f"Приоритеты успешно сохранены в БД: {len(priorities_data)} репозиториев")
 
         except Exception as e:
             logger.error(f"Ошибка сохранения приоритетов в БД: {e}")
@@ -644,7 +632,7 @@ class RepositoryPriorityManager:
 
     def _save_priorities(self):
         """Основной метод сохранения - использует БД"""
-        asyncio.create_task(self._save_priorities_to_db())
+        self._save_priorities_to_db()
 
     def _get_priority_level(self, score: float) -> str:
         """Определяет уровень приоритета по score"""
@@ -667,8 +655,8 @@ class RepositoryPriorityManager:
     def get_priority(self, repo: str) -> Dict:
         if repo not in self.priorities:
             self.priorities[repo] = self._create_default_priority()
-            # Асинхронно сохраняем в БД
-            asyncio.create_task(self._save_priorities_to_db())
+            # Сохраняем в БД
+            self._save_priorities_to_db()
         return self.priorities[repo]
 
     def record_update(self, repo: str):
@@ -676,8 +664,8 @@ class RepositoryPriorityManager:
         priority_data['update_count'] += 1
         priority_data['last_update'] = datetime.now(timezone.utc).isoformat()
         priority_data['consecutive_failures'] = 0  # Сбрасываем счетчик ошибок
-        # Асинхронно сохраняем в БД
-        asyncio.create_task(self._save_priorities_to_db())
+        # Сохраняем в БД
+        self._save_priorities_to_db()
         logger.info(f"Зарегистрировано обновление для {repo}. Всего обновлений: {priority_data['update_count']}")
 
     def record_check(self, repo: str, success: bool = True, response_time: float = 0.0):
@@ -2008,7 +1996,7 @@ async def priority_command(message: Message):
 
     # Сначала синхронизируемся с базой данных
     try:
-        await priority_manager.initialize_priorities()
+        priority_manager.initialize_priorities()
         logger.info("✅ Приоритеты синхронизированы с БД для команды /priority")
     except Exception as e:
         logger.warning(f"Не удалось синхронизировать приоритеты с БД: {e}")
@@ -2093,7 +2081,7 @@ async def sync_command(message: Message):
             return
         
         # Синхронизируем приоритеты
-        await priority_manager.initialize_priorities()
+        priority_manager.initialize_priorities()
         
         # Получаем обновленную статистику
         priority_stats = priority_manager.get_priority_stats()

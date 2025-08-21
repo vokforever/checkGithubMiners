@@ -13,26 +13,27 @@ class SupabaseManager:
     def __init__(self):
         """Initialize Supabase connection"""
         self.supabase_url = os.getenv("SUPABASE_URL")
-        self.supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+        # Пробуем сначала SUPABASE_KEY, затем SUPABASE_SERVICE_ROLE_KEY для совместимости
+        self.supabase_key = os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
         
         if not self.supabase_url or not self.supabase_key:
-            raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in .env file")
+            raise ValueError("SUPABASE_URL and SUPABASE_KEY (or SUPABASE_SERVICE_ROLE_KEY) must be set in .env file")
         
         self.client: Client = create_client(self.supabase_url, self.supabase_key)
         self.logger = logging.getLogger(__name__)
     
-    async def create_tables(self):
+    def create_tables(self):
         """Create necessary tables if they don't exist"""
         try:
             # Create repository_priorities table
-            await self.client.rpc('create_repository_priorities_table')
+            self.client.rpc('create_repository_priorities_table').execute()
             self.logger.info("Repository priorities table created/verified")
         except Exception as e:
             self.logger.warning(f"Could not create table via RPC: {e}")
             # Fallback: try to create table directly via SQL
-            await self._create_table_directly()
+            self._create_table_directly()
     
-    async def _create_table_directly(self):
+    def _create_table_directly(self):
         """Create table directly using SQL"""
         try:
             sql = """
@@ -60,12 +61,12 @@ class SupabaseManager:
             CREATE INDEX IF NOT EXISTS idx_checkgithub_priority_level ON checkgithub_repository_priorities(priority_level);
             """
             
-            await self.client.rpc('exec_sql', {'sql': sql})
+            self.client.rpc('exec_sql', {'sql': sql}).execute()
             self.logger.info("Repository priorities table created directly")
         except Exception as e:
             self.logger.error(f"Failed to create table directly: {e}")
     
-    async def store_repository_priorities(self, priorities_data: Dict[str, Any]):
+    def store_repository_priorities(self, priorities_data: Dict[str, Any]):
         """Store repository priorities data in Supabase"""
         try:
             priorities = priorities_data.get('priorities', {})
@@ -79,7 +80,6 @@ class SupabaseManager:
                     'repo_name': repo_name,
                     'display_name': repo_name.split('/')[-1],  # Extract repo name from owner/repo
                     'update_count': repo_data.get('update_count', 0),
-                    'last_update': repo_data.get('last_update'),
                     'check_interval': repo_data.get('check_interval', 1440),
                     'priority_score': repo_data.get('priority_score', 0.0),
                     'last_check': repo_data.get('last_check'),
@@ -93,7 +93,7 @@ class SupabaseManager:
                 repos_data.append(repo_record)
             
             # Upsert data (insert or update)
-            result = await self.client.table('checkgithub_repository_priorities').upsert(
+            result = self.client.table('checkgithub_repository_priorities').upsert(
                 repos_data,
                 on_conflict='repo_name'
             ).execute()
@@ -105,19 +105,19 @@ class SupabaseManager:
             self.logger.error(f"Error storing repository priorities: {e}")
             raise
     
-    async def get_repository_priorities(self) -> List[Dict[str, Any]]:
+    def get_repository_priorities(self) -> List[Dict[str, Any]]:
         """Retrieve repository priorities from Supabase"""
         try:
-            result = await self.client.table('checkgithub_repository_priorities').select('*').execute()
+            result = self.client.table('checkgithub_repository_priorities').select('*').execute()
             return result.data
         except Exception as e:
             self.logger.error(f"Error retrieving repository priorities: {e}")
             raise
     
-    async def get_priority_summary(self) -> Dict[str, Any]:
+    def get_priority_summary(self) -> Dict[str, Any]:
         """Get summary statistics of repository priorities"""
         try:
-            repos = await self.get_repository_priorities()
+            repos = self.get_repository_priorities()
             
             high_priority = len([r for r in repos if r['priority_score'] >= 0.5])
             medium_priority = len([r for r in repos if 0.1 < r['priority_score'] < 0.5])
@@ -134,7 +134,7 @@ class SupabaseManager:
             self.logger.error(f"Error calculating summary: {e}")
             return {}
     
-    async def update_repository_priority(self, repo_name: str, **kwargs):
+    def update_repository_priority(self, repo_name: str, **kwargs):
         """Update specific repository priority data"""
         try:
             # Update priority level and color if score changed
@@ -144,7 +144,7 @@ class SupabaseManager:
             
             kwargs['updated_at'] = 'now()'
             
-            result = await self.client.table('checkgithub_repository_priorities').update(kwargs).eq('repo_name', repo_name).execute()
+            result = self.client.table('checkgithub_repository_priorities').update(kwargs).eq('repo_name', repo_name).execute()
             
             if not result.data:
                 raise ValueError(f"Repository {repo_name} not found")
@@ -156,7 +156,7 @@ class SupabaseManager:
             self.logger.error(f"Error updating repository {repo_name}: {e}")
             raise
     
-    async def log_repository_check(self, repo_name: str, check_result: str, **kwargs):
+    def log_repository_check(self, repo_name: str, check_result: str, **kwargs):
         """Log a repository check result"""
         try:
             log_data = {
@@ -170,7 +170,7 @@ class SupabaseManager:
                 'new_release_url': kwargs.get('new_release_url')
             }
             
-            result = await self.client.table('checkgithub_check_logs').insert(log_data).execute()
+            result = self.client.table('checkgithub_check_logs').insert(log_data).execute()
             self.logger.info(f"Logged check result for {repo_name}: {check_result}")
             return result.data[0] if result.data else None
             
@@ -178,10 +178,10 @@ class SupabaseManager:
             self.logger.error(f"Error logging check result for {repo_name}: {e}")
             raise
     
-    async def get_telegram_report(self) -> str:
+    def get_telegram_report(self) -> str:
         """Generate Telegram format report from Supabase data"""
         try:
-            repos = await self.get_repository_priorities()
+            repos = self.get_repository_priorities()
             
             # Sort by priority score
             repos.sort(key=lambda x: x['priority_score'], reverse=True)
@@ -207,7 +207,7 @@ class SupabaseManager:
             ])
             
             # Check for connection issues
-            issues = await self._get_connection_issues()
+            issues = self._get_connection_issues()
             if issues:
                 report_lines.extend(["", "⚠️ Проблемы с подключением"])
             
@@ -217,10 +217,10 @@ class SupabaseManager:
             self.logger.error(f"Error generating Telegram report: {e}")
             return "❌ Ошибка при генерации отчета"
     
-    async def _get_connection_issues(self) -> List[Dict[str, Any]]:
+    def _get_connection_issues(self) -> List[Dict[str, Any]]:
         """Get repositories with connection issues"""
         try:
-            repos = await self.get_repository_priorities()
+            repos = self.get_repository_priorities()
             return [r for r in repos if r.get('consecutive_failures', 0) > 0]
         except Exception as e:
             self.logger.error(f"Error getting connection issues: {e}")
@@ -253,7 +253,7 @@ class SupabaseManager:
         else:
             return 'Низкий приоритет'
     
-    async def migrate_from_json(self, json_file_path: str = "repo_priority.json"):
+    def migrate_from_json(self, json_file_path: str = "repo_priority.json"):
         """Migrate data from existing JSON file to Supabase"""
         try:
             if not os.path.exists(json_file_path):
@@ -264,7 +264,7 @@ class SupabaseManager:
                 data = json.load(f)
             
             # Store data in Supabase
-            await self.store_repository_priorities(data)
+            self.store_repository_priorities(data)
             
             # Create backup of JSON file
             backup_path = f"{json_file_path}.backup.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -279,10 +279,10 @@ class SupabaseManager:
             self.logger.error(f"Error migrating from JSON: {e}")
             raise
     
-    async def export_to_json(self, file_path: str = None) -> str:
+    def export_to_json(self, file_path: str = None) -> str:
         """Export current Supabase data to JSON format"""
         try:
-            repos = await self.get_repository_priorities()
+            repos = self.get_repository_priorities()
             
             export_data = {
                 "priorities": {},
@@ -315,35 +315,35 @@ class SupabaseManager:
             self.logger.error(f"Error exporting to JSON: {e}")
             raise
     
-    async def close(self):
+    def close(self):
         """Close Supabase connection"""
         if hasattr(self, 'client'):
             try:
-                await self.client.auth.sign_out()
+                self.client.auth.sign_out()
             except:
                 pass
 
 # Convenience functions for easy integration
-async def get_telegram_report() -> str:
+def get_telegram_report() -> str:
     """Get Telegram format report"""
     supabase = SupabaseManager()
     try:
-        return await supabase.get_telegram_report()
+        return supabase.get_telegram_report()
     finally:
-        await supabase.close()
+        supabase.close()
 
-async def update_repository_data(repo_name: str, **kwargs):
+def update_repository_data(repo_name: str, **kwargs):
     """Update repository data"""
     supabase = SupabaseManager()
     try:
-        return await supabase.update_repository_priority(repo_name, **kwargs)
+        return supabase.update_repository_priority(repo_name, **kwargs)
     finally:
-        await supabase.close()
+        supabase.close()
 
-async def log_check(repo_name: str, result: str, **kwargs):
+def log_check(repo_name: str, result: str, **kwargs):
     """Log a check result"""
     supabase = SupabaseManager()
     try:
-        return await supabase.log_repository_check(repo_name, result, **kwargs)
+        return supabase.log_repository_check(repo_name, result, **kwargs)
     finally:
-        await supabase.close()
+        supabase.close()
