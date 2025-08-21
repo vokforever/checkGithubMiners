@@ -81,7 +81,6 @@ STATE_FILE = "last_releases.json"
 FILTERS_FILE = "user_filters.json"
 HISTORY_FILE = "releases_history.json"
 USERS_FILE = "users.json"
-PRIORITY_FILE = "repo_priority.json"
 STATISTICS_FILE = "bot_statistics.json"
 
 # Создаем папку для резервных копий
@@ -528,38 +527,67 @@ class StatisticsManager:
 # --- УЛУЧШЕНЫЙ КЛАСС ДЛЯ УПРАВЛЕНИЯ ПРИОРИТЕТАМИ ---
 class RepositoryPriorityManager:
     def __init__(self):
-        self.priority_file = PRIORITY_FILE
-        self.priorities = self._load_priorities()
-        self.last_priority_update = self._load_last_priority_update()
+        self.priorities = {}
+        self.last_priority_update = None
+        self.supabase_manager = None
+        self.db_synced = False
+        
+        # Инициализируем SupabaseManager
+        try:
+            from supabase_config import SupabaseManager
+            self.supabase_manager = SupabaseManager()
+            logger.info("SupabaseManager успешно инициализирован")
+        except ImportError as e:
+            logger.error(f"Не удалось импортировать SupabaseManager: {e}")
+        except Exception as e:
+            logger.error(f"Ошибка инициализации SupabaseManager: {e}")
 
-    def _load_priorities(self) -> Dict[str, Dict]:
-        if os.path.exists(self.priority_file):
-            try:
-                with open(self.priority_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
+    async def _load_priorities_from_db(self) -> Dict[str, Dict]:
+        """Загружает приоритеты из базы данных Supabase"""
+        if not self.supabase_manager:
+            logger.error("SupabaseManager недоступен, невозможно загрузить приоритеты")
+            raise RuntimeError("SupabaseManager недоступен")
 
-                    if isinstance(data, dict) and 'priorities' in data:
-                        priorities = data['priorities']
-                    else:
-                        priorities = data
+        try:
+            # Получаем данные из базы
+            result = await self.supabase_manager.client.table('checkgithub_repository_priorities').select('*').execute()
+            
+            if result.data:
+                db_priorities = {}
+                for record in result.data:
+                    repo_name = record.get('repo_name')
+                    if repo_name in REPOS:
+                        db_priorities[repo_name] = {
+                            'update_count': record.get('update_count', 0),
+                            'last_update': record.get('last_update'),
+                            'check_interval': record.get('check_interval', DEFAULT_CHECK_INTERVAL_MINUTES),
+                            'priority_score': float(record.get('priority_score', 0.0)),
+                            'last_check': record.get('last_check'),
+                            'consecutive_failures': record.get('consecutive_failures', 0),
+                            'total_checks': record.get('total_checks', 0),
+                            'average_response_time': float(record.get('average_response_time', 0.0))
+                        }
 
-                    # Обновляем структуру данных для всех репозиториев
-                    for repo in REPOS:
-                        if repo not in priorities:
-                            priorities[repo] = self._create_default_priority()
-                        else:
-                            # Добавляем недостающие поля
-                            default_priority = self._create_default_priority()
-                            for field, default_value in default_priority.items():
-                                if field not in priorities[repo]:
-                                    priorities[repo][field] = default_value
+                # Заполняем недостающие репозитории дефолтными значениями
+                for repo in REPOS:
+                    if repo not in db_priorities:
+                        db_priorities[repo] = self._create_default_priority()
 
-                    return priorities
-            except (json.JSONDecodeError, IOError) as e:
-                logger.error(f"Ошибка загрузки приоритетов: {e}")
-                self._backup_corrupted_file(self.priority_file)
+                self.db_synced = True
+                logger.info(f"Приоритеты загружены из БД: {len(db_priorities)} репозиториев")
+                return db_priorities
+            else:
+                logger.warning("В БД нет данных о приоритетах, создаем дефолтные")
+                return {repo: self._create_default_priority() for repo in REPOS}
 
-        return {repo: self._create_default_priority() for repo in REPOS}
+        except Exception as e:
+            logger.error(f"Ошибка загрузки приоритетов из БД: {e}")
+            raise RuntimeError(f"Не удалось загрузить приоритеты из БД: {e}")
+
+    async def initialize_priorities(self):
+        """Инициализирует приоритеты при запуске"""
+        self.priorities = await self._load_priorities_from_db()
+        self.last_priority_update = datetime.now(timezone.utc)
 
     def _create_default_priority(self) -> Dict:
         return {
@@ -573,55 +601,74 @@ class RepositoryPriorityManager:
             'average_response_time': 0.0
         }
 
-    def _load_last_priority_update(self) -> Optional[datetime]:
-        if os.path.exists(self.priority_file):
-            try:
-                with open(self.priority_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    if isinstance(data, dict) and 'last_update' in data:
-                        return datetime.fromisoformat(data['last_update'])
-            except (json.JSONDecodeError, IOError, ValueError):
-                pass
-        return None
+    async def _save_priorities_to_db(self):
+        """Сохраняет приоритеты в базу данных Supabase"""
+        if not self.supabase_manager:
+            logger.error("SupabaseManager недоступен, невозможно сохранить приоритеты")
+            raise RuntimeError("SupabaseManager недоступен")
 
-    def _backup_corrupted_file(self, file_path: str):
-        """Создает резервную копию поврежденного файла"""
         try:
-            if os.path.exists(file_path):
-                backup_name = f"{os.path.basename(file_path)}.corrupted.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                backup_path = os.path.join(BACKUP_DIR, backup_name)
-                shutil.copy2(file_path, backup_path)
-                logger.warning(f"Создана резервная копия поврежденного файла: {backup_path}")
+            repos_data = []
+            for repo_name, repo_data in self.priorities.items():
+                # Определяем уровень приоритета
+                priority_level = self._get_priority_level(repo_data.get('priority_score', 0))
+                
+                repo_record = {
+                    'repo_name': repo_name,
+                    'display_name': repo_name.split('/')[-1],
+                    'update_count': repo_data.get('update_count', 0),
+                    'last_update': repo_data.get('last_update'),
+                    'check_interval': repo_data.get('check_interval', DEFAULT_CHECK_INTERVAL_MINUTES),
+                    'priority_score': repo_data.get('priority_score', 0.0),
+                    'last_check': repo_data.get('last_check'),
+                    'consecutive_failures': repo_data.get('consecutive_failures', 0),
+                    'total_checks': repo_data.get('total_checks', 0),
+                    'average_response_time': repo_data.get('average_response_time', 0.0),
+                    'priority_level': priority_level,
+                    'priority_color': self._get_priority_color(repo_data.get('priority_score', 0)),
+                    'updated_at': 'now()'
+                }
+                repos_data.append(repo_record)
+
+            # Upsert данные в БД
+            result = await self.supabase_manager.client.table('checkgithub_repository_priorities').upsert(
+                repos_data,
+                on_conflict='repo_name'
+            ).execute()
+
+            logger.info(f"Приоритеты успешно сохранены в БД: {len(repos_data)} репозиториев")
+
         except Exception as e:
-            logger.error(f"Не удалось создать резервную копию: {e}")
+            logger.error(f"Ошибка сохранения приоритетов в БД: {e}")
+            raise RuntimeError(f"Не удалось сохранить приоритеты в БД: {e}")
 
     def _save_priorities(self):
-        try:
-            # Создаем резервную копию перед сохранением
-            if os.path.exists(self.priority_file):
-                backup_file = f"{self.priority_file}.bak"
-                shutil.copy2(self.priority_file, backup_file)
+        """Основной метод сохранения - использует БД"""
+        asyncio.create_task(self._save_priorities_to_db())
 
-            data = {
-                'priorities': self.priorities,
-                'last_update': datetime.now(timezone.utc).isoformat(),
-                'version': '2.0',
-                'repos_count': len(REPOS),
-                'created_at': datetime.now(timezone.utc).isoformat(),
-                'backup_created': True
-            }
+    def _get_priority_level(self, score: float) -> str:
+        """Определяет уровень приоритета по score"""
+        if score >= PRIORITY_THRESHOLD_HIGH:
+            return 'high'
+        elif score <= PRIORITY_THRESHOLD_LOW:
+            return 'low'
+        else:
+            return 'medium'
 
-            with open(self.priority_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-
-            logger.debug(f"Приоритеты успешно сохранены в {self.priority_file}")
-        except IOError as e:
-            logger.error(f"Ошибка сохранения приоритетов: {e}")
+    def _get_priority_color(self, score: float) -> str:
+        """Определяет цвет приоритета по score"""
+        if score >= PRIORITY_THRESHOLD_HIGH:
+            return '🔴'
+        elif score <= PRIORITY_THRESHOLD_LOW:
+            return '🟢'
+        else:
+            return '🟡'
 
     def get_priority(self, repo: str) -> Dict:
         if repo not in self.priorities:
             self.priorities[repo] = self._create_default_priority()
-            self._save_priorities()
+            # Асинхронно сохраняем в БД
+            asyncio.create_task(self._save_priorities_to_db())
         return self.priorities[repo]
 
     def record_update(self, repo: str):
@@ -629,7 +676,8 @@ class RepositoryPriorityManager:
         priority_data['update_count'] += 1
         priority_data['last_update'] = datetime.now(timezone.utc).isoformat()
         priority_data['consecutive_failures'] = 0  # Сбрасываем счетчик ошибок
-        self._save_priorities()
+        # Асинхронно сохраняем в БД
+        asyncio.create_task(self._save_priorities_to_db())
         logger.info(f"Зарегистрировано обновление для {repo}. Всего обновлений: {priority_data['update_count']}")
 
     def record_check(self, repo: str, success: bool = True, response_time: float = 0.0):
@@ -650,7 +698,8 @@ class RepositoryPriorityManager:
         else:
             priority_data['consecutive_failures'] += 1
             
-        self._save_priorities()
+        # Асинхронно сохраняем в БД
+        asyncio.create_task(self._save_priorities_to_db())
 
     def should_update_priorities(self) -> bool:
         if not self.last_priority_update:
@@ -707,7 +756,8 @@ class RepositoryPriorityManager:
             self.priorities[repo] = new_priority_data
 
         self.last_priority_update = datetime.now(timezone.utc)
-        self._save_priorities()
+        # Асинхронно сохраняем в БД
+        asyncio.create_task(self._save_priorities_to_db())
 
         logger.info(f"Приоритеты обновлены. Изменено: {updated_count}/{len(REPOS)} репозиториев")
 
@@ -1532,10 +1582,11 @@ async def start_command(message: Message):
             "• /help — подробная справка\n"
             "• /donate — поддержать разработчика\n\n"
             "🔧 *Административные команды:*\n"
+            "• /stats — общая статистика бота\n"
             "• /priority — приоритеты репозиториев\n"
+            "• /sync — синхронизация с базой данных\n"
             "• /pstats — статистика приоритетов\n"
             "• /checkall — проверить все репозитории\n"
-            "• /stats — общая статистика бота\n"
             "• /backup — создать резервные копии\n\n"
             "ℹ️ *Как это работает:*\n"
             "Бот автоматически проверяет репозитории и уведомляет о новых релизах. "
@@ -1798,6 +1849,7 @@ async def help_command(message: Message):
             "🔧 *Административные команды:*\n"
             "• /stats — общая статистика бота\n"
             "• /priority — приоритеты репозиториев\n"
+            "• /sync — синхронизация с базой данных\n"
             "• /pstats — статистика приоритетов\n"
             "• /checkall — проверить все репозитории\n"
             "• /backup — создать резервные копии\n\n"
@@ -1805,7 +1857,8 @@ async def help_command(message: Message):
             "⚙️ *Как работает система приоритетов:*\n"
             "• Бот автоматически адаптирует частоту проверок\n"
             "• Активные репозитории проверяются чаще\n"
-            "• Неактивные — реже (экономия ресурсов)\n\n"
+            "• Неактивные — реже (экономия ресурсов)\n"
+            "• Все данные хранятся в Supabase\n\n"
             
             "💡 *Советы по использованию:*\n"
             "• Используйте конкретные фильтры (например: 'qubitcoin')\n"
@@ -1953,7 +2006,20 @@ async def priority_command(message: Message):
 
     logger.info(f"📊 Администратор запрашивает приоритеты репозиториев")
 
+    # Сначала синхронизируемся с базой данных
+    try:
+        await priority_manager.initialize_priorities()
+        logger.info("✅ Приоритеты синхронизированы с БД для команды /priority")
+    except Exception as e:
+        logger.warning(f"Не удалось синхронизировать приоритеты с БД: {e}")
+
     priority_info = "📊 *Приоритеты репозиториев:*\n\n"
+
+    # Добавляем информацию об источнике данных
+    if priority_manager.db_synced:
+        priority_info += "🗄️ *Источник:* База данных Supabase\n\n"
+    else:
+        priority_info += "⚠️ *Источник:* Локальные данные (БД недоступна)\n\n"
 
     # Сортируем репозитории по приоритету (сначала высокий)
     sorted_repos = sorted(
@@ -2005,6 +2071,59 @@ async def priority_command(message: Message):
     )
 
     await message.answer(priority_info, parse_mode="Markdown")
+
+async def sync_command(message: Message):
+    """Обработчик команды /sync - принудительная синхронизация с БД"""
+    user_manager.add_user(message.from_user.id, message.from_user.username)
+    user_manager.record_activity(message.from_user.id, 'command')
+
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ У вас нет прав для выполнения этой команды.")
+        return
+
+    logger.info(f"🔄 Администратор запрашивает синхронизацию с БД")
+
+    try:
+        # Отправляем сообщение о начале синхронизации
+        sync_msg = await message.answer("🔄 Синхронизация с базой данных...")
+        
+        # Проверяем доступность Supabase
+        if not priority_manager.supabase_manager:
+            await sync_msg.edit_text("❌ Supabase недоступен. Проверьте настройки подключения.", parse_mode="Markdown")
+            return
+        
+        # Синхронизируем приоритеты
+        await priority_manager.initialize_priorities()
+        
+        # Получаем обновленную статистику
+        priority_stats = priority_manager.get_priority_stats()
+        
+        # Проверяем статус синхронизации
+        sync_status = "✅" if priority_manager.db_synced else "⚠️"
+        sync_text = "Синхронизировано" if priority_manager.db_synced else "Не синхронизировано"
+        
+        success_message = (
+            f"{sync_status} *Синхронизация завершена!*\n\n"
+            f"📊 *Статус приоритетов:*\n"
+            f"• Высокий приоритет: {priority_stats['high_priority']} 🔴\n"
+            f"• Средний приоритет: {priority_stats['medium_priority']} 🟡\n"
+            f"• Низкий приоритет: {priority_stats['low_priority']} 🟢\n"
+            f"• Проблемные: {priority_stats['failing_repos']} ⚠️\n\n"
+            f"🗄️ *База данных:*\n"
+            f"• Статус: {sync_text}\n"
+            f"• Репозиториев: {priority_stats['total_repos']}\n"
+            f"• Средний интервал: {priority_stats['average_interval']} мин\n\n"
+            f"🔄 *Последнее обновление:* {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        
+        # Обновляем сообщение
+        await sync_msg.edit_text(success_message, parse_mode="Markdown")
+        logger.info("✅ Синхронизация с БД завершена успешно")
+        
+    except Exception as e:
+        error_message = f"❌ *Ошибка синхронизации:* {str(e)}"
+        await sync_msg.edit_text(error_message, parse_mode="Markdown")
+        logger.error(f"❌ Ошибка синхронизации с БД: {e}")
 
 async def pstats_command(message: Message):
     """Обработчик команды /pstats"""
@@ -2132,7 +2251,6 @@ async def backup_command(message: Message):
             FILTERS_FILE,
             HISTORY_FILE,
             USERS_FILE,
-            PRIORITY_FILE,
             STATISTICS_FILE
         ]
 
@@ -2208,7 +2326,6 @@ async def debug_command(message: Message):
             (FILTERS_FILE, "Фильтры пользователей"),
             (HISTORY_FILE, "История релизов"),
             (USERS_FILE, "База пользователей"),
-            (PRIORITY_FILE, "Приоритеты репозиториев"),
             (STATISTICS_FILE, "Статистика бота")
         ]
         
@@ -2234,6 +2351,21 @@ async def debug_command(message: Message):
             debug_info += f"✅ Модуль планировщика доступен\n"
         except ImportError:
             debug_info += f"❌ Модуль планировщика недоступен\n"
+        
+        # Статус Supabase
+        debug_info += f"\n🗄️ *Supabase:*\n"
+        try:
+            from supabase_config import SupabaseManager
+            supabase = SupabaseManager()
+            debug_info += f"✅ SupabaseManager доступен\n"
+            if supabase.supabase_url:
+                debug_info += f"• URL: {supabase.supabase_url[:30]}...\n"
+            if supabase.supabase_key:
+                debug_info += f"• Ключ: {supabase.supabase_key[:10]}...\n"
+        except ImportError:
+            debug_info += f"❌ Модуль Supabase недоступен\n"
+        except Exception as e:
+            debug_info += f"⚠️ Ошибка Supabase: {str(e)[:50]}...\n"
         
         await message.answer(debug_info, parse_mode="Markdown")
         
@@ -2417,6 +2549,7 @@ def register_handlers(dp: Dispatcher):
     # Административные команды
     dp.message.register(stats_command, Command("stats"))
     dp.message.register(priority_command, Command("priority"))
+    dp.message.register(sync_command, Command("sync"))
     dp.message.register(pstats_command, Command("pstats"))
     dp.message.register(checkall_command, Command("checkall"))
     dp.message.register(backup_command, Command("backup"))
@@ -2618,6 +2751,18 @@ async def main():
     scheduler.start()
     logger.info("⏰ Планировщик запущен")
     print("⏰ Планировщик запущен")
+
+    # Инициализируем приоритеты из базы данных
+    logger.info("🗄️ Инициализация приоритетов из базы данных...")
+    print("🗄️ Инициализация приоритетов из базы данных...")
+    try:
+        await priority_manager.initialize_priorities()
+        logger.info("✅ Приоритеты успешно инициализированы из БД")
+        print("✅ Приоритеты успешно инициализированы из БД")
+    except Exception as e:
+        logger.error(f"❌ Ошибка инициализации приоритетов: {e}")
+        print(f"❌ Ошибка инициализации приоритетов: {e}")
+        # Продолжаем работу с локальными данными
 
     # Выводим информацию о конфигурации
     print(f"\n📊 КОНФИГУРАЦИЯ БОТА:")
