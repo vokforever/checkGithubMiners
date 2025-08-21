@@ -12,7 +12,17 @@ __pycache__/
 
 # Logs
 *.log
+logs/
+
+# Backups
+backups/
 
 # IDE
 .vscode/
 .idea/
+
+# Cursor IDE
+.cursor/
+
+# SQL files
+*.sql

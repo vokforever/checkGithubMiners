@@ -4,3 +4,4 @@ apscheduler==3.10.4
 beautifulsoup4==4.12.2
 python-dotenv==1.0.0
 telegramify-markdown==1.0.0
+supabase==2.3.4
