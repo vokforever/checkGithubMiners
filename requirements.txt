@@ -1,8 +1,8 @@
-aiohttp==3.9.1
-aiogram==3.6.0
-apscheduler==3.10.4
-beautifulsoup4==4.12.2
-python-dotenv==1.0.0
-telegramify-markdown==1.0.0
-supabase==2.3.4
-psutil==5.9.8
+aiohttp
+aiogram
+apscheduler
+beautifulsoup4
+python-dotenv
+telegramify-markdown
+supabase
+psutil
