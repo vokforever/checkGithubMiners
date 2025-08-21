@@ -686,8 +686,8 @@ class RepositoryPriorityManager:
         else:
             priority_data['consecutive_failures'] += 1
             
-        # Асинхронно сохраняем в БД
-        asyncio.create_task(self._save_priorities_to_db())
+        # Сохраняем в БД
+        self._save_priorities_to_db()
 
     def should_update_priorities(self) -> bool:
         if not self.last_priority_update:
@@ -744,8 +744,8 @@ class RepositoryPriorityManager:
             self.priorities[repo] = new_priority_data
 
         self.last_priority_update = datetime.now(timezone.utc)
-        # Асинхронно сохраняем в БД
-        asyncio.create_task(self._save_priorities_to_db())
+        # Сохраняем в БД
+        self._save_priorities_to_db()
 
         logger.info(f"Приоритеты обновлены. Изменено: {updated_count}/{len(REPOS)} репозиториев")
 
