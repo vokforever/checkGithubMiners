@@ -8,6 +8,7 @@ import ctypes
 import traceback
 import shutil
 import re
+import urllib.request
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Optional, List, Set, Tuple
 from aiohttp import ClientSession, ClientError, ClientResponseError
@@ -1840,7 +1841,8 @@ async def help_command(message: Message):
             "• /sync — синхронизация с базой данных\n"
             "• /pstats — статистика приоритетов\n"
             "• /checkall — проверить все репозитории\n"
-            "• /backup — создать резервные копии\n\n"
+            "• /backup — создать резервные копии\n"
+            "• /ip — проверить внешний IP адрес\n\n"
             
             "⚙️ *Как работает система приоритетов:*\n"
             "• Бот автоматически адаптирует частоту проверок\n"
@@ -2439,6 +2441,21 @@ async def logs_command(message: Message):
             parse_mode="Markdown"
         )
 
+async def ip_command(message: Message):
+    """Проверка IP адреса"""
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ Доступ запрещен")
+        return
+
+    try:
+        # Прямой запрос без Docker (если бот работает в том же контейнере)
+        response = urllib.request.urlopen('http://ifconfig.me', timeout=10)
+        ip = response.read().decode().strip()
+        await message.answer(f"🌐 IP: `{ip}`", parse_mode="Markdown")
+        
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {str(e)}")
+
 # --- ОБРАБОТЧИК НЕИЗВЕСТНЫХ КОМАНД ---
 async def unknown_command(message: Message):
     """Обработчик неизвестных команд"""
@@ -2543,6 +2560,7 @@ def register_handlers(dp: Dispatcher):
     dp.message.register(backup_command, Command("backup"))
     dp.message.register(debug_command, Command("debug"))
     dp.message.register(logs_command, Command("logs"))
+    dp.message.register(ip_command, Command("ip"))
     
     # Обработчики callback-кнопок
     dp.callback_query.register(cancel_filter_callback, F.data == "cancel_filter")
@@ -2777,23 +2795,43 @@ async def main():
     # Уведомляем админа о запуске
     if ADMIN_ID:
         try:
+            # Получаем IP адрес для стартового сообщения
+            ip_address = "Неизвестно"
+            try:
+                response = urllib.request.urlopen('http://ifconfig.me', timeout=5)
+                ip_address = response.read().decode().strip()
+            except Exception as e:
+                logger.warning(f"Не удалось получить IP адрес: {e}")
+                ip_address = "Ошибка получения"
+            
             startup_message = (
                 f"🚀 *Бот успешно запущен!*\n\n"
                 f"⏰ Время запуска: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                 f"📦 Отслеживается репозиториев: {len(REPOS)}\n"
                 f"👥 Пользователей в базе: {user_manager.get_count()}\n"
                 f"🔍 Пользователей с фильтрами: {filter_manager.get_users_with_filters_count()}\n"
-                f"📈 Релизов в истории: {history_manager.get_count()}\n\n"
+                f"📈 Релизов в истории: {history_manager.get_count()}\n"
+                f"🌐 Внешний IP: `{ip_address}`\n\n"
                 f"Бот готов к работе! 🎉"
             )
             await bot.send_message(ADMIN_ID, startup_message, parse_mode="Markdown")
         except Exception as e:
             logger.warning(f"Не удалось отправить уведомление о запуске админу: {e}")
 
+    # Получаем IP адрес для консольного вывода
+    console_ip = "Неизвестно"
+    try:
+        response = urllib.request.urlopen('http://ifconfig.me', timeout=5)
+        console_ip = response.read().decode().strip()
+    except Exception as e:
+        logger.warning(f"Не удалось получить IP адрес для консоли: {e}")
+        console_ip = "Ошибка получения"
+    
     logger.info("🎉 Бот успешно запущен и готов к работе!")
     print("\n" + "=" * 50)
     print("🎉 БОТ УСПЕШНО ЗАПУЩЕН И ГОТОВ К РАБОТЕ!")
     print("=" * 50)
+    print(f"🌐 Внешний IP: {console_ip}")
     print("📱 Используйте Ctrl+C для остановки бота")
     print("📋 Логи сохраняются в папку logs/")
     print("💾 Резервные копии создаются в папку backups/")
