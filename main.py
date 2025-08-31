@@ -2448,10 +2448,18 @@ async def ip_command(message: Message):
         return
 
     try:
-        # Прямой запрос без Docker (если бот работает в том же контейнере)
-        response = urllib.request.urlopen('http://ifconfig.me', timeout=10)
-        ip = response.read().decode().strip()
-        await message.answer(f"🌐 IP: `{ip}`", parse_mode="Markdown")
+        # Используем 2ip.ua для получения IP (более надежный сервис)
+        response = urllib.request.urlopen('https://2ip.ua/ru/', timeout=10)
+        html = response.read().decode()
+        
+        # Извлекаем IP адрес из HTML
+        import re
+        ip_match = re.search(r'(\d+\.\d+\.\d+\.\d+)', html)
+        if ip_match:
+            ip = ip_match.group(1)
+            await message.answer(f"🌐 IP: `{ip}`", parse_mode="Markdown")
+        else:
+            await message.answer("❌ Не удалось извлечь IP адрес из ответа")
         
     except Exception as e:
         await message.answer(f"❌ Ошибка: {str(e)}")
@@ -2798,8 +2806,16 @@ async def main():
             # Получаем IP адрес для стартового сообщения
             ip_address = "Неизвестно"
             try:
-                response = urllib.request.urlopen('http://ifconfig.me', timeout=5)
-                ip_address = response.read().decode().strip()
+                response = urllib.request.urlopen('https://2ip.ua/ru/', timeout=5)
+                html = response.read().decode()
+                
+                # Извлекаем IP адрес из HTML
+                import re
+                ip_match = re.search(r'(\d+\.\d+\.\d+\.\d+)', html)
+                if ip_match:
+                    ip_address = ip_match.group(1)
+                else:
+                    ip_address = "Не удалось извлечь"
             except Exception as e:
                 logger.warning(f"Не удалось получить IP адрес: {e}")
                 ip_address = "Ошибка получения"
@@ -2821,8 +2837,16 @@ async def main():
     # Получаем IP адрес для консольного вывода
     console_ip = "Неизвестно"
     try:
-        response = urllib.request.urlopen('http://ifconfig.me', timeout=5)
-        console_ip = response.read().decode().strip()
+        response = urllib.request.urlopen('https://2ip.ua/ru/', timeout=5)
+        html = response.read().decode()
+        
+        # Извлекаем IP адрес из HTML
+        import re
+        ip_match = re.search(r'(\d+\.\d+\.\d+\.\d+)', html)
+        if ip_match:
+            console_ip = ip_match.group(1)
+        else:
+            console_ip = "Не удалось извлечь"
     except Exception as e:
         logger.warning(f"Не удалось получить IP адрес для консоли: {e}")
         console_ip = "Ошибка получения"
