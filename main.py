@@ -58,7 +58,7 @@ PRIORITY_UPDATE_DAYS = 7
 # --- СПИСОК РЕПОЗИТОРИЕВ ---
 REPOS = [
     "andru-kun/wildrig-multi",
-    "OneZeroMiner/onezerominer", 
+    "OneZeroMiner/onezerominer",
     "trexminer/T-Rex",
     "xmrig/xmrig",
     "Lolliedieb/lolMiner-releases",
@@ -67,7 +67,8 @@ REPOS = [
     "pooler/cpuminer",
     "rplant8/cpuminer-opt-rplant",
     "JayDDee/cpuminer-opt",
-    "alephium/gpu-miner"
+    "alephium/gpu-miner",
+    "GoldenMinerNetwork/golden-miner-nockchain-gpu-miner"
 ]
 
 # --- ПАРАМЕТРЫ ПРИОРИТЕТНОЙ ПРОВЕРКИ ---
@@ -587,8 +588,18 @@ class RepositoryPriorityManager:
 
     def initialize_priorities(self):
         """Инициализирует приоритеты при запуске"""
-        self.priorities = self._load_priorities_from_db()
-        self.last_priority_update = datetime.now(timezone.utc)
+        try:
+            self.priorities = self._load_priorities_from_db()
+            self.last_priority_update = datetime.now(timezone.utc)
+        except RuntimeError as e:
+            if "SupabaseManager недоступен" in str(e):
+                logger.warning(f"Не удалось загрузить приоритеты из БД, используем значения по умолчанию: {e}")
+                # Создаем дефолтные приоритеты для всех репозиториев
+                self.priorities = {repo: self._create_default_priority() for repo in REPOS}
+                self.last_priority_update = datetime.now(timezone.utc)
+            else:
+                logger.error(f"Ошибка инициализации приоритетов: {e}")
+                raise
 
     def _create_default_priority(self) -> Dict:
         return {
@@ -633,7 +644,14 @@ class RepositoryPriorityManager:
 
     def _save_priorities(self):
         """Основной метод сохранения - использует БД"""
-        self._save_priorities_to_db()
+        try:
+            self._save_priorities_to_db()
+        except RuntimeError as e:
+            if "SupabaseManager недоступен" in str(e):
+                logger.warning(f"Не удалось сохранить приоритеты в БД: {e}")
+            else:
+                logger.error(f"Ошибка сохранения приоритетов в БД: {e}")
+                raise
 
     def _get_priority_level(self, score: float) -> str:
         """Определяет уровень приоритета по score"""
@@ -656,8 +674,15 @@ class RepositoryPriorityManager:
     def get_priority(self, repo: str) -> Dict:
         if repo not in self.priorities:
             self.priorities[repo] = self._create_default_priority()
-            # Сохраняем в БД
-            self._save_priorities_to_db()
+            # Сохраняем в БД с обработкой ошибок
+            try:
+                self._save_priorities_to_db()
+            except RuntimeError as e:
+                if "SupabaseManager недоступен" in str(e):
+                    logger.warning(f"Не удалось сохранить приоритет в БД для {repo}: {e}")
+                else:
+                    logger.error(f"Ошибка сохранения приоритетов в БД для {repo}: {e}")
+                    raise
         return self.priorities[repo]
 
     def record_update(self, repo: str):
@@ -665,8 +690,15 @@ class RepositoryPriorityManager:
         priority_data['update_count'] += 1
         priority_data['last_update'] = datetime.now(timezone.utc).isoformat()
         priority_data['consecutive_failures'] = 0  # Сбрасываем счетчик ошибок
-        # Сохраняем в БД
-        self._save_priorities_to_db()
+        # Сохраняем в БД с обработкой ошибок
+        try:
+            self._save_priorities_to_db()
+        except RuntimeError as e:
+            if "SupabaseManager недоступен" in str(e):
+                logger.warning(f"Не удалось сохранить обновление в БД для {repo}: {e}")
+            else:
+                logger.error(f"Ошибка сохранения приоритетов в БД для {repo}: {e}")
+                raise
         logger.info(f"Зарегистрировано обновление для {repo}. Всего обновлений: {priority_data['update_count']}")
 
     def record_check(self, repo: str, success: bool = True, response_time: float = 0.0):
@@ -687,8 +719,15 @@ class RepositoryPriorityManager:
         else:
             priority_data['consecutive_failures'] += 1
             
-        # Сохраняем в БД
-        self._save_priorities_to_db()
+        # Сохраняем в БД с обработкой ошибок
+        try:
+            self._save_priorities_to_db()
+        except RuntimeError as e:
+            if "SupabaseManager недоступен" in str(e):
+                logger.warning(f"Не удалось сохранить проверку в БД для {repo}: {e}")
+            else:
+                logger.error(f"Ошибка сохранения приоритетов в БД для {repo}: {e}")
+                raise
 
     def should_update_priorities(self) -> bool:
         if not self.last_priority_update:
@@ -745,8 +784,15 @@ class RepositoryPriorityManager:
             self.priorities[repo] = new_priority_data
 
         self.last_priority_update = datetime.now(timezone.utc)
-        # Сохраняем в БД
-        self._save_priorities_to_db()
+        # Сохраняем в БД с обработкой ошибок
+        try:
+            self._save_priorities_to_db()
+        except RuntimeError as e:
+            if "SupabaseManager недоступен" in str(e):
+                logger.warning(f"Не удалось сохранить обновленные приоритеты в БД: {e}")
+            else:
+                logger.error(f"Ошибка сохранения приоритетов в БД: {e}")
+                raise
 
         logger.info(f"Приоритеты обновлены. Изменено: {updated_count}/{len(REPOS)} репозиториев")
 

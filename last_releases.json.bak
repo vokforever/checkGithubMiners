@@ -1,0 +1,13 @@
+{
+  "andru-kun/wildrig-multi": "0.45.8",
+  "OneZeroMiner/onezerominer": "v1.6.2",
+  "trexminer/T-Rex": "0.26.8",
+  "xmrig/xmrig": "v6.24.0",
+  "Lolliedieb/lolMiner-releases": "1.98a",
+  "doktor83/SRBMiner-Multi": "2.9.8",
+  "nicehash/nicehashminer": "3.1.1.6",
+  "pooler/cpuminer": "v2.5.1",
+  "rplant8/cpuminer-opt-rplant": "5.0.46",
+  "JayDDee/cpuminer-opt": "v25.6",
+  "alephium/gpu-miner": "v0.5.4"
+}

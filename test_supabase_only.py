@@ -38,7 +38,7 @@ async def test_supabase_only():
         
         # Тестируем загрузку приоритетов из БД
         print("\n🔄 Загрузка приоритетов из базы данных...")
-        await priority_manager.initialize_priorities()
+        priority_manager.initialize_priorities()
         
         # Проверяем загруженные данные
         print(f"📊 Загружено приоритетов: {len(priority_manager.priorities)}")
@@ -73,7 +73,7 @@ async def test_supabase_only():
         priority_manager.priorities[test_repo]['update_count'] += 1
         
         # Сохраняем в БД
-        await priority_manager._save_priorities_to_db()
+        priority_manager._save_priorities_to_db()
         print(f"✅ Приоритет {test_repo} сохранен в БД")
         
         # Восстанавливаем оригинальное значение
@@ -81,7 +81,7 @@ async def test_supabase_only():
         priority_manager.priorities[test_repo]['update_count'] -= 1
         
         # Сохраняем обратно
-        await priority_manager._save_priorities_to_db()
+        priority_manager._save_priorities_to_db()
         print(f"✅ Оригинальный приоритет {test_repo} восстановлен")
         
         print("\n✅ Тест Supabase-only системы завершен успешно!")
